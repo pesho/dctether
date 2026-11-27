@@ -140,8 +140,13 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     .await?;
 
     let (env, x11_ready) = match reader.next().await {
-        Ok(Some(Frame::Control(Control::Ready { env, x11 }))) => (env, x11),
-        Ok(Some(Frame::Control(Control::Error { message }))) => return Err(message),
+        Ok(Some(Frame::Control(Control::Ready { env, x11 }))) => {
+            check_env(&env)?;
+            (env, x11)
+        }
+        Ok(Some(Frame::Control(Control::Error { message }))) => {
+            return Err(message.chars().filter(|c| !c.is_control()).collect());
+        }
         other => return Err(format!("container agent failed during setup ({})", describe(other))),
     };
     crate::debug!(
@@ -174,14 +179,17 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
 
     // The user's command.
     let cmd = if a.cmd.is_empty() {
-        vec![shell.unwrap_or_else(|| "/bin/sh".into())]
+        // The shell comes from the container: only accept an absolute path,
+        // so it can't be taken for a devcontainer option.
+        vec![shell.filter(|s| is_safe_path(s)).unwrap_or_else(|| "/bin/sh".into())]
     } else {
         a.cmd
     };
     let mut user = Command::new(&dc);
     user.arg("exec").args(&a.dc_args);
     for (k, v) in &env {
-        user.arg("--remote-env").arg(format!("{k}={v}"));
+        // One token, so the value can never be parsed as an option.
+        user.arg(format!("--remote-env={k}={v}"));
     }
     user.args(&cmd);
     let mut child = user.spawn().map_err(|e| format!("{dc}: {e}"))?;
@@ -205,6 +213,34 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
         let _ = agent.kill().await;
     }
     Ok(exit_code(status))
+}
+
+/// Variables the agent may set, and what their values may look like. The
+/// agent runs in the (untrusted) container and these end up on the host's
+/// `devcontainer` command line.
+const FORWARDED_ENV: [&str; 5] = ["SSH_AUTH_SOCK", "DISPLAY", "XAUTHORITY", "BROWSER", "DCTETHER_SESSION"];
+
+pub fn check_env(env: &[(String, String)]) -> Result<(), String> {
+    for (k, v) in env {
+        if !FORWARDED_ENV.contains(&k.as_str()) {
+            return Err(format!("container agent asked to set unexpected variable {k:?}"));
+        }
+        let ok = if k == "DISPLAY" {
+            v.strip_prefix(':')
+                .is_some_and(|n| (1..=5).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()))
+        } else {
+            is_safe_path(v)
+        };
+        if !ok {
+            return Err(format!("container agent sent an invalid value for {k}: {v:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// An absolute path without control characters.
+fn is_safe_path(v: &str) -> bool {
+    v.starts_with('/') && v.len() <= 4096 && !v.chars().any(char::is_control)
 }
 
 async fn send(out: &Out, f: Frame) -> Result<(), String> {
@@ -688,6 +724,27 @@ mod tests {
     }
 
     #[test]
+    fn validates_agent_env() {
+        let ok = |k: &str, v: &str| check_env(&[(k.to_string(), v.to_string())]).is_ok();
+        assert!(ok("SSH_AUTH_SOCK", "/tmp/dctether-0123/agent.sock"));
+        assert!(ok("DISPLAY", ":0"));
+        assert!(ok("DISPLAY", ":10"));
+        assert!(ok("XAUTHORITY", "/tmp/d/Xauthority"));
+        assert!(ok("BROWSER", "/home/u/.cache/dctether/0.1.0-ab/dctether-browser"));
+        assert!(ok("DCTETHER_SESSION", "/tmp/d"));
+        assert!(!ok("LD_PRELOAD", "/tmp/x.so"));
+        assert!(!ok("--docker-path", "/x"));
+        assert!(!ok("SSH_AUTH_SOCK", "--docker-path=/x"));
+        assert!(!ok("SSH_AUTH_SOCK", "relative/path"));
+        assert!(!ok("BROWSER", "/bin/x\n--docker-path=/y"));
+        assert!(!ok("DISPLAY", "host:0"));
+        assert!(!ok("DISPLAY", ":"));
+        assert!(!ok("DISPLAY", ":0.0"));
+        assert!(!ok("DISPLAY", "--x"));
+        assert!(is_safe_path("/bin/bash") && !is_safe_path("--docker-path=/x") && !is_safe_path("bash"));
+    }
+
+    #[test]
     fn boot_script_lists_known_arches() {
         let s = boot_script(&[("x86_64", "0.1.0-abcd".into())], false);
         assert!(s.contains("x86_64) b=\"$c/0.1.0-abcd/dctether\";;"));
@@ -704,6 +761,8 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         let arch = std::process::Command::new("uname").arg("-m").output().unwrap();
         let arch = String::from_utf8(arch.stdout).unwrap().trim().to_string();
+        // The script normalizes macOS-style names, as a container could report them.
+        let arch = if arch == "arm64" { "aarch64".to_string() } else { arch };
         let name = "0.0.0-test".to_string();
         let sh = |script: &str, input: &[u8]| {
             let mut c = Command::new("sh")

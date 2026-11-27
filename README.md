@@ -159,6 +159,19 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`).
   caps frames at 1 MiB and allows 256 channels at once.
 - The X cookie goes only through the protocol pipe, never on a command
   line. Host command lines (`ps`) show only the forwarded paths.
+- What the agent reports ends up on the host's `devcontainer` command
+  line: the environment for your command, and the default shell. The host
+  accepts only the five variables it expects (`SSH_AUTH_SOCK`, `DISPLAY`,
+  `XAUTHORITY`, `BROWSER`, `DCTETHER_SESSION`) and only absolute paths
+  (`:<n>` for `DISPLAY`), each passed as a single `--remote-env=K=V`
+  argument.
+- The agent binary lives in the container user's home, so anything
+  running as that user can replace it. The checks above don't depend on
+  the agent behaving. One guarantee does: the agent reports the network
+  namespace itself, so "the real cookie never enters the container" (relay
+  mode) holds only for an unmodified agent. A modified one could claim to
+  share the host's namespace and be offered the direct path, cookie
+  included.
 
 ## Install
 
@@ -199,6 +212,10 @@ needed.
   clipboard.
 - Forwards end with the `dctether exec` session. Background programs that
   outlive it lose them.
+- Flow control is a small bounded queue per channel. When one is full,
+  reading from the pipe pauses. An X client that stops reading its socket
+  can therefore stall the session's other forwards until it reads again or
+  disconnects.
 
 ## License
 
