@@ -424,12 +424,15 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
   host offers the direct path, cookie included, only after the check
   described under [X11](#x11-direct-and-relayed). What that check shows
   is that the agent, or something it could pass the one-time value to, is
-  in the host's network namespace. One thing does depend on the agent:
-  it reports the container's ID, which names the port forwarder that
-  sessions on a container share. A modified agent that reported another
-  container's ID could get that container's sessions to use its
-  forwarder, so that their forwarded ports lead to it instead (from
-  reading the code; not tested).
+  in the host's network namespace. Two things still depend on the
+  agent's word (both from reading the code; not tested). Its report of
+  the network namespace also decides whether ports are forwarded at all,
+  since a container on the host's network needs none; a false report
+  there only changes whether that container's own configured ports are
+  forwarded. And it reports the container's ID, which names the port
+  forwarder that sessions on a container share. A modified agent that
+  reported another container's ID could get that container's sessions to
+  use its forwarder, so that their forwarded ports lead to it instead.
 
 ## Platforms
 
