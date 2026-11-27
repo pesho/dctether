@@ -19,7 +19,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 
 use crate::mux::{self, FrameReader, Out, Registry};
-use crate::proto::{ChannelKind, Control, Frame, PROTOCOL_VERSION, X11Direct, X11Offer, X11Ready, XAuthCookie};
+use crate::proto::{
+    ChannelKind, Control, Frame, PROTOCOL_VERSION, WaylandStatus, X11Direct, X11Offer, X11Ready, XAuthCookie,
+};
 use crate::xauth;
 
 const X11_DIR: &str = "/tmp/.X11-unix";
@@ -45,7 +47,12 @@ pub async fn main() -> i32 {
     let _ = out.send(Frame::Control(hello)).await;
 
     let setup = match reader.next().await {
-        Ok(Some(Frame::Control(Control::Setup { ssh_agent, browser, x11 }))) => (ssh_agent, browser, x11),
+        Ok(Some(Frame::Control(Control::Setup {
+            ssh_agent,
+            browser,
+            x11,
+            wayland,
+        }))) => (ssh_agent, browser, x11, wayland),
         Ok(None) => return 0,
         other => {
             eprintln!("dctether agent: expected setup, got {other:?}");
@@ -53,7 +60,7 @@ pub async fn main() -> i32 {
         }
     };
 
-    let mut session = match Session::create(setup.0, setup.1, setup.2).await {
+    let mut session = match Session::create(setup.0, setup.1, setup.2, setup.3).await {
         Ok(s) => s,
         Err(e) => {
             let _ = out
@@ -70,6 +77,7 @@ pub async fn main() -> i32 {
         .send(Frame::Control(Control::Ready {
             env: session.env.clone(),
             x11: session.x11.clone(),
+            wayland: session.wayland,
         }))
         .await;
 
@@ -145,6 +153,7 @@ struct Session {
     listeners: Vec<(UnixListener, ChannelKind)>,
     env: Vec<(String, String)>,
     x11: Option<X11Ready>,
+    wayland: Option<WaylandStatus>,
 }
 
 impl Drop for Session {
@@ -157,7 +166,7 @@ impl Drop for Session {
 }
 
 impl Session {
-    async fn create(ssh_agent: bool, browser: bool, x11: Option<X11Offer>) -> io::Result<Session> {
+    async fn create(ssh_agent: bool, browser: bool, x11: Option<X11Offer>, wayland: bool) -> io::Result<Session> {
         let dir = std::env::temp_dir().join(format!("dctether-{}", hex(&random_bytes(8)?)));
         std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let mut s = Session {
@@ -166,6 +175,7 @@ impl Session {
             listeners: vec![],
             env: vec![],
             x11: None,
+            wayland: None,
         };
         let listen = |s: &mut Session, name: &str, kind| -> io::Result<PathBuf> {
             let path = s.dir.join(name);
@@ -193,6 +203,15 @@ impl Session {
 
         if let Some(offer) = x11 {
             s.setup_x11(offer)?;
+        }
+
+        if wayland {
+            let path = Path::new(crate::wayland::CONTAINER_SOCKET);
+            let status = probe_wayland(path);
+            if status == WaylandStatus::Ready {
+                s.set_env("WAYLAND_DISPLAY", path);
+            }
+            s.wayland = Some(status);
         }
         Ok(s)
     }
@@ -273,6 +292,19 @@ fn probe_x11(display: u32, auth: Option<&XAuthCookie>) -> io::Result<()> {
     }
 }
 
+/// Is `path` a socket someone accepts connections on? Connecting and
+/// closing again is harmless for a Wayland compositor.
+fn probe_wayland(path: &Path) -> WaylandStatus {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => WaylandStatus::Ready,
+            Err(_) => WaylandStatus::Dead,
+        },
+        _ => WaylandStatus::Missing,
+    }
+}
+
 fn ensure_x11_dir() -> io::Result<()> {
     match std::fs::create_dir(X11_DIR) {
         Ok(()) => std::fs::set_permissions(X11_DIR, std::fs::Permissions::from_mode(0o1777)),
@@ -339,6 +371,26 @@ fn passwd_shell(passwd: &str, uid: u32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probes_wayland_socket_states() {
+        let dir = std::env::temp_dir().join(format!("dctether-wl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("wl.sock");
+        assert_eq!(probe_wayland(&sock), WaylandStatus::Missing);
+        std::fs::write(dir.join("file"), b"").unwrap();
+        assert_eq!(probe_wayland(&dir.join("file")), WaylandStatus::Missing);
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert_eq!(probe_wayland(&sock), WaylandStatus::Ready);
+        // A socket file nobody accepts stream connections on, like a mount
+        // of a socket from an earlier login session. (A dropped listener
+        // isn't reliable here: a test spawning children concurrently can
+        // briefly hold a copy of its fd between fork and exec.)
+        let dead = dir.join("dead.sock");
+        let _dgram = std::os::unix::net::UnixDatagram::bind(&dead).unwrap();
+        assert_eq!(probe_wayland(&dead), WaylandStatus::Dead);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn finds_shell_in_passwd() {

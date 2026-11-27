@@ -98,11 +98,17 @@ pub enum Control {
         ssh_agent: bool,
         browser: bool,
         x11: Option<X11Offer>,
+        /// Look for the Wayland socket `dctether up` mounts.
+        #[serde(default)]
+        wayland: bool,
     },
     Ready {
         /// Environment for the user's `devcontainer exec`.
         env: Vec<(String, String)>,
         x11: Option<X11Ready>,
+        /// `None` when Wayland was not asked for.
+        #[serde(default)]
+        wayland: Option<WaylandStatus>,
     },
     /// Fatal setup error; the sender exits after sending it.
     Error { message: String },
@@ -127,6 +133,19 @@ pub struct X11Direct {
 pub struct XAuthCookie {
     pub name: String,
     pub data: Vec<u8>,
+}
+
+/// State of the mounted Wayland socket in the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaylandStatus {
+    /// Mounted and the compositor accepts connections.
+    Ready,
+    /// Not mounted (the container wasn't created by `dctether up`).
+    Missing,
+    /// Mounted, but nobody listens: the mount pins a socket from an
+    /// earlier login session.
+    Dead,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +314,7 @@ mod tests {
                 }),
                 relay: true,
             }),
+            wayland: true,
         }));
         roundtrip(Frame::Control(Control::Ready {
             env: vec![("DISPLAY".into(), ":10".into())],
@@ -305,10 +325,20 @@ mod tests {
                     data: vec![9; 16],
                 },
             }),
+            wayland: Some(WaylandStatus::Dead),
         }));
         roundtrip(Frame::Control(Control::Error {
             message: "nope".into(),
         }));
+    }
+
+    #[test]
+    fn wayland_fields_default_when_absent() {
+        let setup: Control =
+            serde_json::from_str(r#"{"type":"setup","ssh_agent":true,"browser":true,"x11":null}"#).unwrap();
+        assert!(matches!(setup, Control::Setup { wayland: false, .. }));
+        let ready: Control = serde_json::from_str(r#"{"type":"ready","env":[],"x11":null}"#).unwrap();
+        assert!(matches!(ready, Control::Ready { wayland: None, .. }));
     }
 
     #[test]

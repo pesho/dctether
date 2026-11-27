@@ -6,6 +6,7 @@ mod browser;
 mod host;
 mod mux;
 mod proto;
+mod wayland;
 mod x11;
 mod xauth;
 
@@ -33,25 +34,34 @@ macro_rules! debug {
 
 const USAGE: &str = "\
 usage: dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
+       dctether up [--no-wayland] [DEVCONTAINER-UP-OPTIONS]
 
-Run COMMAND (default: the container user's shell from /etc/passwd) with `devcontainer exec`,
-forwarding the host's SSH agent, X11 display and browser opener into it.
+exec  Run COMMAND (default: the container user's shell from /etc/passwd) with
+      `devcontainer exec`, forwarding the host's SSH agent, X11 display, browser
+      opener and (if the container was created by `dctether up`) Wayland into it.
+up    Run `devcontainer up`, also mounting the host's Wayland socket into the
+      container. Mounts are fixed at creation: an existing container is reused
+      as it is (add --remove-existing-container to recreate it).
 
-Everything before `--` that is not a dctether option is passed to
-`devcontainer exec` unchanged, e.g. --workspace-folder, --container-id, --config.
+Everything that is not a dctether option (before `--`, for exec) is passed to
+devcontainer unchanged, e.g. --workspace-folder, --container-id, --config.
+Without them, devcontainer uses the dev container of the current directory.
 
-Options:
+exec options:
   --no-ssh-agent   don't forward $SSH_AUTH_SOCK
   --no-x11         don't forward $DISPLAY
   --no-browser     don't set BROWSER
+  --no-wayland     don't set WAYLAND_DISPLAY
   --x11-relay      always relay X11, even if the host display is reachable directly
+
+up options:
+  --no-wayland     don't mount the Wayland socket
 
 Environment:
   DCTETHER_DEVCONTAINER  devcontainer CLI to run (default: devcontainer)
   DCTETHER_AGENT_DIR     directory with dctether-linux-<arch> container builds
   DCTETHER_DEBUG=1       print diagnostics to stderr
 ";
-
 fn main() {
     if std::env::var_os("DCTETHER_DEBUG").is_some_and(|v| !v.is_empty() && v != "0") {
         DEBUG.store(true, Ordering::Relaxed);
@@ -68,6 +78,7 @@ fn main() {
     } else {
         match args.get(1).map(String::as_str) {
             Some("exec") => host::exec_main(&args[2..]),
+            Some("up") => host::up_main(&args[2..]),
             Some("agent") => agent_main(&args[2..]),
             Some("browser") => browser_helper(&args[2..]),
             Some("--version" | "-V") => {

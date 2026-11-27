@@ -10,6 +10,8 @@ what a VS Code Dev Containers terminal gets:
   clients open their windows on your desktop.
 - **Browser**: `BROWSER` opens `http(s)` URLs in your host's browser,
   for example for OAuth logins started by CLIs in the container.
+- **Wayland**: `WAYLAND_DISPLAY` points at your host's compositor, if the
+  container was created with `dctether up`.
 
 You don't need VS Code. Nothing is written to `devcontainer.json`, the
 image or shell rc files. The environment is set only on dctether's own
@@ -18,15 +20,20 @@ image or shell rc files. The environment is set only on dctether's own
 ## Usage
 
 ```sh
-cd ~/src/project            # a folder whose dev container is running
+cd ~/src/project            # a folder with a dev container configuration
+dctether up                 # start its container (optional, see below)
 dctether exec               # interactive shell
 dctether exec -- git push   # one command
 ```
 
-Like `devcontainer exec`, dctether finds the container from the current
+Like `devcontainer`, dctether finds the container from the current
 directory, so no options are needed. To pick another container, add
-`--workspace-folder DIR` or `--container-id ID`. dctether doesn't start
-containers. Start one with `devcontainer up` or VS Code first.
+`--workspace-folder DIR` or `--container-id ID`.
+
+`dctether exec` works with a running container however it was started
+(`devcontainer up`, VS Code, `dctether up`). `dctether up` is
+`devcontainer up` plus a mount of your Wayland socket. That mount is the
+only way to give the container Wayland (see [Wayland](#wayland-mounted-at-creation)).
 
 ```text
 dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
@@ -34,22 +41,30 @@ dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
   --no-ssh-agent   don't forward $SSH_AUTH_SOCK
   --no-x11         don't forward $DISPLAY
   --no-browser     don't set BROWSER
+  --no-wayland     don't set WAYLAND_DISPLAY
   --x11-relay      always relay X11, even if the host display is reachable directly
+
+dctether up [--no-wayland] [DEVCONTAINER-UP-OPTIONS]
+
+  --no-wayland     don't mount the Wayland socket
 ```
 
-Everything before `--` that isn't one of these options goes to
+For `exec`, everything before `--` that isn't one of these options goes to
 `devcontainer exec` unchanged, for example `--workspace-folder`,
 `--container-id`, `--config` or `--remote-env`. Those must all be options. The
 command always goes after `--`. Without a command, dctether starts the
-container user's shell from `/etc/passwd`.
+container user's shell from `/etc/passwd`. For `up`, every argument other
+than `--no-wayland` goes to `devcontainer up`.
 
 The command's exit status becomes dctether's. When stdin is a terminal,
 `devcontainer exec` allocates a pty as usual, and window size changes and
 Ctrl-C behave as in a plain `devcontainer exec`.
 
 Each forward is active only if the host has it: `SSH_AUTH_SOCK` must be
-set and `DISPLAY` must name a reachable X server. A forward stays up
-while the `dctether exec` session runs and ends with it.
+set, `DISPLAY` must name a reachable X server, and for Wayland
+`WAYLAND_DISPLAY` must be set (and the container created by `dctether
+up`). A forward stays up while the `dctether exec` session runs and ends
+with it; the Wayland mount lasts as long as the container.
 
 | Variable | Meaning |
 |---|---|
@@ -122,6 +137,33 @@ author's machine, and a third the first time a version is used.
   still lists both, so a client that skips `QueryExtension` could still
   try them.
 
+### Wayland: mounted at creation
+
+Wayland clients pass file descriptors (window buffers, keymaps) over
+their socket, and a byte relay can't carry those. So instead of relaying,
+`dctether up` bind-mounts the compositor's socket
+(`$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY`) into the container at
+`/tmp/dctether-wayland.sock`, as VS Code does with its own mount. The
+container shares the host's kernel, so clients talk to the compositor
+directly. `dctether exec` then checks that the socket accepts connections
+and sets `WAYLAND_DISPLAY=/tmp/dctether-wayland.sock`. An absolute path,
+so the container needs no `XDG_RUNTIME_DIR`.
+
+Caveats, and why it can be turned off (`--no-wayland` on `up` or `exec`):
+
+- **Only at creation.** Docker can't add mounts to a running container,
+  and `devcontainer up` reuses an existing container as it is. To add the
+  mount to an existing container, recreate it with
+  `dctether up --remove-existing-container`. Containers started any other
+  way simply don't get Wayland.
+- **Breaks after a new login.** The mount pins the socket that existed
+  when the container was created. After you log out and back in, the
+  compositor listens on a new socket at the same path, and the container's
+  copy goes dead. `dctether exec` notices, says so, and doesn't set
+  `WAYLAND_DISPLAY`. Recreating the container fixes it.
+- **Same user ID.** Compositor sockets are usually accessible only to
+  their owner, so the container user needs your host user ID (or root).
+
 ### Async runtime
 
 dctether runs on [tokio](https://tokio.rs) with a single-threaded
@@ -134,7 +176,7 @@ this load.
 
 dctether treats the container as untrusted. Even so, every forward gives
 the container real power over your host session. Enable only the forwards
-you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`).
+you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`).
 
 - **SSH agent.** While a session is open, any process in the container
   that can reach the socket can ask your agent to sign with your keys.
@@ -151,6 +193,14 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`).
   X cookie, in a 0600 file. With `--network=host` it could already connect
   to the abstract socket, but not authenticate. In relay mode it gets only
   a per-session cookie that works through the relay.
+- **Wayland.** For as long as the container exists, anything in it that
+  can reach the mounted socket is a client of your compositor, with the
+  same access as your own apps: it can open windows and use the clipboard.
+  The core Wayland protocol doesn't let clients read each other's input or
+  screen contents, unlike X11. Compositors add extensions on top (screen
+  capture, input emulation, clipboard managers), and which clients may use
+  them depends on the compositor. The mount is the compositor's real
+  socket, not a relay, and dctether doesn't filter it.
 - **Browser.** The container can ask the host to open URLs. The host
   accepts only `http://` and `https://` URLs of printable ASCII without
   spaces, at most 8 KiB long. It passes the URL to `xdg-open` (or `open` on
@@ -167,8 +217,8 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`).
   line. Host command lines (`ps`) show only the forwarded paths.
 - What the agent reports ends up on the host's `devcontainer` command
   line: the environment for your command, and the default shell. The host
-  accepts only the five variables it expects (`SSH_AUTH_SOCK`, `DISPLAY`,
-  `XAUTHORITY`, `BROWSER`, `DCTETHER_SESSION`) and only absolute paths
+  accepts only the six variables it expects (`SSH_AUTH_SOCK`, `DISPLAY`,
+  `XAUTHORITY`, `BROWSER`, `DCTETHER_SESSION`, `WAYLAND_DISPLAY`) and only absolute paths
   (`:<n>` for `DISPLAY`), each passed as a single `--remote-env=K=V`
   argument.
 - The agent binary lives in the container user's home, so anything
@@ -207,8 +257,8 @@ needed.
 
 - **Host:** Linux. The code also builds for macOS (XQuartz-style `DISPLAY`
   paths and `open`), but nobody has tested it there yet.
-- **Container:** Linux on x86_64 or aarch64. Tested with an Ubuntu dev
-  container, and with Alpine under qemu-aarch64.
+- **Container:** Linux on x86_64 or aarch64. Tested with Ubuntu and
+  Debian dev containers, and with Alpine under qemu-aarch64.
 
 Linux release builds target `*-unknown-linux-musl` and are statically
 linked. They need no C library from the system, so they run on glibc
@@ -221,8 +271,7 @@ be resolved through mDNS or other NSS-only resolvers. `:0`, `unix:0` and
 
 ## Not supported (yet)
 
-- Wayland, git HTTPS credential helper, port forwarding, gpg agent,
-  clipboard.
+- Git HTTPS credential helper, port forwarding, gpg agent, clipboard.
 - Forwards end with the `dctether exec` session. Background programs that
   outlive it lose them.
 - Flow control is a small bounded queue per channel. When one is full,

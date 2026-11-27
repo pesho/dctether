@@ -22,7 +22,9 @@ use tokio::sync::mpsc;
 
 use crate::browser;
 use crate::mux::{self, ChanMsg, FrameReader, Out, Registry};
-use crate::proto::{ChannelKind, Control, Frame, PROTOCOL_VERSION, X11Direct, X11Offer, X11Ready, XAuthCookie};
+use crate::proto::{
+    ChannelKind, Control, Frame, PROTOCOL_VERSION, WaylandStatus, X11Direct, X11Offer, X11Ready, XAuthCookie,
+};
 use crate::x11::ClientFilter;
 use crate::xauth::{self, Display};
 
@@ -37,6 +39,7 @@ pub struct ExecArgs {
     pub ssh_agent: bool,
     pub x11: bool,
     pub browser: bool,
+    pub wayland: bool,
     pub force_relay: bool,
 }
 
@@ -54,6 +57,7 @@ pub fn parse_exec_args(args: &[String]) -> ExecArgs {
         ssh_agent: true,
         x11: true,
         browser: true,
+        wayland: true,
         force_relay: false,
     };
     for arg in before {
@@ -61,6 +65,7 @@ pub fn parse_exec_args(args: &[String]) -> ExecArgs {
             "--no-ssh-agent" => a.ssh_agent = false,
             "--no-x11" => a.x11 = false,
             "--no-browser" => a.browser = false,
+            "--no-wayland" => a.wayland = false,
             "--x11-relay" => a.force_relay = true,
             _ => a.dc_args.push(arg.clone()),
         }
@@ -135,13 +140,16 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
             ssh_agent: ssh_sock.is_some(),
             browser: a.browser,
             x11: offer,
+            // Only meaningful when this host has a Wayland session to share.
+            wayland: a.wayland && host_wayland_socket().is_some(),
         }),
     )
     .await?;
 
     let (env, x11_ready) = match reader.next().await {
-        Ok(Some(Frame::Control(Control::Ready { env, x11 }))) => {
+        Ok(Some(Frame::Control(Control::Ready { env, x11, wayland }))) => {
             check_env(&env)?;
+            report_wayland(wayland);
             (env, x11)
         }
         Ok(Some(Frame::Control(Control::Error { message }))) => {
@@ -218,7 +226,14 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
 /// Variables the agent may set, and what their values may look like. The
 /// agent runs in the (untrusted) container and these end up on the host's
 /// `devcontainer` command line.
-const FORWARDED_ENV: [&str; 5] = ["SSH_AUTH_SOCK", "DISPLAY", "XAUTHORITY", "BROWSER", "DCTETHER_SESSION"];
+const FORWARDED_ENV: [&str; 6] = [
+    "SSH_AUTH_SOCK",
+    "DISPLAY",
+    "XAUTHORITY",
+    "BROWSER",
+    "DCTETHER_SESSION",
+    "WAYLAND_DISPLAY",
+];
 
 pub fn check_env(env: &[(String, String)]) -> Result<(), String> {
     for (k, v) in env {
@@ -241,6 +256,69 @@ pub fn check_env(env: &[(String, String)]) -> Result<(), String> {
 /// An absolute path without control characters.
 fn is_safe_path(v: &str) -> bool {
     v.starts_with('/') && v.len() <= 4096 && !v.chars().any(char::is_control)
+}
+
+fn host_wayland_socket() -> Option<PathBuf> {
+    crate::wayland::host_socket(
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+    )
+}
+
+fn report_wayland(status: Option<WaylandStatus>) {
+    match status {
+        None => {}
+        Some(WaylandStatus::Ready) => crate::debug!("Wayland: mounted socket is live"),
+        Some(WaylandStatus::Missing) => {
+            crate::debug!("Wayland: no socket mounted (container not created by `dctether up`)")
+        }
+        // The one case worth interrupting for: the user asked for Wayland
+        // (by creating the container with `dctether up`) and it broke.
+        Some(WaylandStatus::Dead) => eprintln!(
+            "dctether: the container's Wayland socket is from an earlier login session and no longer works; \
+             not setting WAYLAND_DISPLAY. Recreate the container with \
+             `dctether up --remove-existing-container` to fix it.\r"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dctether up
+
+/// `devcontainer up` with the host's Wayland socket mounted, unless
+/// `--no-wayland` is given or there is no Wayland session. All other
+/// arguments go to `devcontainer up` unchanged.
+pub fn up_main(args: &[String]) -> i32 {
+    let wayland = !args.iter().any(|a| a == "--no-wayland");
+    let mut dc_args: Vec<String> = args.iter().filter(|a| *a != "--no-wayland").cloned().collect();
+    if wayland {
+        match host_wayland_socket() {
+            None => crate::debug!("no Wayland session (WAYLAND_DISPLAY unset); not mounting a socket"),
+            Some(sock) if !is_socket(&sock) => {
+                eprintln!("dctether: {} is not a socket; not mounting Wayland", sock.display())
+            }
+            Some(sock) => match crate::wayland::mount_arg(&sock) {
+                Ok(m) => {
+                    crate::debug!("mounting {} at {}", sock.display(), crate::wayland::CONTAINER_SOCKET);
+                    dc_args.push(m);
+                }
+                Err(e) => eprintln!("dctether: {e}; not mounting Wayland"),
+            },
+        }
+    }
+    let dc = std::env::var("DCTETHER_DEVCONTAINER").unwrap_or_else(|_| "devcontainer".into());
+    match std::process::Command::new(&dc).arg("up").args(&dc_args).status() {
+        Ok(s) => exit_code(s),
+        Err(e) => {
+            eprintln!("dctether: {dc}: {e}");
+            1
+        }
+    }
+}
+
+fn is_socket(p: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket())
 }
 
 async fn send(out: &Out, f: Frame) -> Result<(), String> {
@@ -720,7 +798,11 @@ mod tests {
 
         let a = parse_exec_args(&s(&["--x11-relay", "--no-browser", "--no-ssh-agent"]));
         assert!(a.dc_args.is_empty() && a.cmd.is_empty());
-        assert!(a.x11 && a.force_relay && !a.browser && !a.ssh_agent);
+        assert!(a.x11 && a.force_relay && !a.browser && !a.ssh_agent && a.wayland);
+
+        let a = parse_exec_args(&s(&["--no-wayland", "--", "--no-wayland"]));
+        assert!(!a.wayland && a.dc_args.is_empty());
+        assert_eq!(a.cmd, s(&["--no-wayland"]));
     }
 
     #[test]
@@ -732,6 +814,8 @@ mod tests {
         assert!(ok("XAUTHORITY", "/tmp/d/Xauthority"));
         assert!(ok("BROWSER", "/home/u/.cache/dctether/0.1.0-ab/dctether-browser"));
         assert!(ok("DCTETHER_SESSION", "/tmp/d"));
+        assert!(ok("WAYLAND_DISPLAY", "/tmp/dctether-wayland.sock"));
+        assert!(!ok("WAYLAND_DISPLAY", "wayland-0"));
         assert!(!ok("LD_PRELOAD", "/tmp/x.so"));
         assert!(!ok("--docker-path", "/x"));
         assert!(!ok("SSH_AUTH_SOCK", "--docker-path=/x"));
