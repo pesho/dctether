@@ -270,14 +270,14 @@ fn report_wayland(status: Option<WaylandStatus>) {
         None => {}
         Some(WaylandStatus::Ready) => crate::debug!("Wayland: mounted socket is live"),
         Some(WaylandStatus::Missing) => {
-            crate::debug!("Wayland: no socket mounted (container not created by `dctether up`)")
+            crate::debug!("Wayland: no socket mounted (container not created by `dctether up` or VS Code)")
         }
-        // The one case worth interrupting for: the user asked for Wayland
-        // (by creating the container with `dctether up`) and it broke.
+        // The one case worth interrupting for: a Wayland socket was mounted
+        // at creation (by `dctether up` or VS Code) and it broke.
         Some(WaylandStatus::Dead) => eprintln!(
             "dctether: the container's Wayland socket is from an earlier login session and no longer works; \
-             not setting WAYLAND_DISPLAY. Recreate the container with \
-             `dctether up --remove-existing-container` to fix it.\r"
+             not setting WAYLAND_DISPLAY. Recreate the container (e.g. \
+             `dctether up --remove-existing-container`) to fix it.\r"
         ),
     }
 }

@@ -5,7 +5,8 @@
 //! socket, which a byte relay can't carry. A bind mount of the socket file
 //! works because the container shares the host's kernel: clients talk to
 //! the compositor directly. A mount can only be added when the container
-//! is created, hence `dctether up`.
+//! is created, hence `dctether up`. Containers created by VS Code carry its
+//! own mount of the same socket, which `dctether exec` uses as a fallback.
 
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,31 @@ use std::path::{Path, PathBuf};
 /// `WAYLAND_DISPLAY` may be an absolute path, so no `XDG_RUNTIME_DIR` is
 /// needed in the container.
 pub const CONTAINER_SOCKET: &str = "/tmp/dctether-wayland.sock";
+
+/// VS Code's Dev Containers extension mounts the host socket as
+/// `/tmp/vscode-wayland-<uuid>.sock`. That is its internal naming, not a
+/// documented interface; if it changes, the fallback simply finds nothing.
+const VSCODE_PREFIX: &str = "vscode-wayland-";
+const VSCODE_SUFFIX: &str = ".sock";
+
+/// Sockets to try in `dir` (the container's `/tmp`), in order: dctether's
+/// own mount, then VS Code's, sorted for a stable choice.
+pub fn candidates(dir: &Path) -> Vec<PathBuf> {
+    let own = Path::new(CONTAINER_SOCKET).file_name().expect("constant has a file name");
+    let mut vscode: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(VSCODE_PREFIX) && n.ends_with(VSCODE_SUFFIX))
+        })
+        .collect();
+    vscode.sort();
+    std::iter::once(dir.join(own)).chain(vscode).collect()
+}
 
 /// The host compositor socket named by `WAYLAND_DISPLAY`: an absolute path,
 /// or a name relative to `XDG_RUNTIME_DIR` (as libwayland resolves it).
@@ -56,6 +82,33 @@ mod tests {
         assert_eq!(host_socket(Some("wayland-0"), Some("relative")), None);
         assert_eq!(host_socket(Some(""), Some("/run/user/1000")), None);
         assert_eq!(host_socket(None, Some("/run/user/1000")), None);
+    }
+
+    #[test]
+    fn lists_own_socket_then_vscode_ones() {
+        let dir = std::env::temp_dir().join(format!("dctether-wl-cand-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in [
+            "vscode-wayland-b.sock",
+            "vscode-wayland-a.sock",
+            "vscode-wayland-x.lock",
+            "vscode-ssh-auth-1.sock",
+            "other.sock",
+        ] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        assert_eq!(
+            candidates(&dir),
+            vec![
+                dir.join("dctether-wayland.sock"),
+                dir.join("vscode-wayland-a.sock"),
+                dir.join("vscode-wayland-b.sock"),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        // A missing directory still yields dctether's own path.
+        assert_eq!(candidates(&dir), vec![dir.join("dctether-wayland.sock")]);
+        assert_eq!(candidates(Path::new("/tmp"))[0], Path::new(CONTAINER_SOCKET));
     }
 
     #[test]

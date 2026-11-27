@@ -11,7 +11,7 @@ what a VS Code Dev Containers terminal gets:
 - **Browser**: `BROWSER` opens `http(s)` URLs in your host's browser,
   for example for OAuth logins started by CLIs in the container.
 - **Wayland**: `WAYLAND_DISPLAY` points at your host's compositor, if the
-  container was created with `dctether up`.
+  container was created with `dctether up` (or by VS Code).
 
 You don't need VS Code. Nothing is written to `devcontainer.json`, the
 image or shell rc files. The environment is set only on dctether's own
@@ -32,8 +32,9 @@ directory, so no options are needed. To pick another container, add
 
 `dctether exec` works with a running container however it was started
 (`devcontainer up`, VS Code, `dctether up`). `dctether up` is
-`devcontainer up` plus a mount of your Wayland socket. That mount is the
-only way to give the container Wayland (see [Wayland](#wayland-mounted-at-creation)).
+`devcontainer up` plus a mount of your Wayland socket. Wayland needs a
+mount made when the container is created, by `dctether up` or by VS Code
+(see [Wayland](#wayland-mounted-at-creation)).
 
 ```text
 dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
@@ -63,7 +64,7 @@ Ctrl-C behave as in a plain `devcontainer exec`.
 Each forward is active only if the host has it: `SSH_AUTH_SOCK` must be
 set, `DISPLAY` must name a reachable X server, and for Wayland
 `WAYLAND_DISPLAY` must be set (and the container created by `dctether
-up`). A forward stays up while the `dctether exec` session runs and ends
+up` or VS Code). A forward stays up while the `dctether exec` session runs and ends
 with it; the Wayland mount lasts as long as the container.
 
 | Variable | Meaning |
@@ -149,13 +150,20 @@ directly. `dctether exec` then checks that the socket accepts connections
 and sets `WAYLAND_DISPLAY=/tmp/dctether-wayland.sock`. An absolute path,
 so the container needs no `XDG_RUNTIME_DIR`.
 
+If that socket isn't there, `dctether exec` falls back to the one VS
+Code mounts in containers it creates, `/tmp/vscode-wayland-<uuid>.sock`,
+with the same check. That name is VS Code's internal naming, not a
+documented interface. If it changes, the fallback finds nothing and
+`WAYLAND_DISPLAY` stays unset. dctether only points `WAYLAND_DISPLAY` at
+a socket that is already in the container, so this adds no exposure.
+
 Caveats, and why it can be turned off (`--no-wayland` on `up` or `exec`):
 
 - **Only at creation.** Docker can't add mounts to a running container,
   and `devcontainer up` reuses an existing container as it is. To add the
   mount to an existing container, recreate it with
   `dctether up --remove-existing-container`. Containers started any other
-  way simply don't get Wayland.
+  way (other than by VS Code) simply don't get Wayland.
 - **Breaks after a new login.** The mount pins the socket that existed
   when the container was created. After you log out and back in, the
   compositor listens on a new socket at the same path, and the container's

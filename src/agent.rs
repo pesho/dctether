@@ -206,10 +206,10 @@ impl Session {
         }
 
         if wayland {
-            let path = Path::new(crate::wayland::CONTAINER_SOCKET);
-            let status = probe_wayland(path);
-            if status == WaylandStatus::Ready {
-                s.set_env("WAYLAND_DISPLAY", path);
+            let (status, path) = pick_wayland(&crate::wayland::candidates(Path::new("/tmp")));
+            if let Some(p) = path {
+                crate::debug!("Wayland socket: {}", p.display());
+                s.set_env("WAYLAND_DISPLAY", &p);
             }
             s.wayland = Some(status);
         }
@@ -305,6 +305,20 @@ fn probe_wayland(path: &Path) -> WaylandStatus {
     }
 }
 
+/// The first live socket among `candidates`. Otherwise `Dead` if any of
+/// them exists but is dead (reported to the user), else `Missing`.
+fn pick_wayland(candidates: &[PathBuf]) -> (WaylandStatus, Option<PathBuf>) {
+    let mut status = WaylandStatus::Missing;
+    for p in candidates {
+        match probe_wayland(p) {
+            WaylandStatus::Ready => return (WaylandStatus::Ready, Some(p.clone())),
+            WaylandStatus::Dead => status = WaylandStatus::Dead,
+            WaylandStatus::Missing => {}
+        }
+    }
+    (status, None)
+}
+
 fn ensure_x11_dir() -> io::Result<()> {
     match std::fs::create_dir(X11_DIR) {
         Ok(()) => std::fs::set_permissions(X11_DIR, std::fs::Permissions::from_mode(0o1777)),
@@ -389,6 +403,16 @@ mod tests {
         let dead = dir.join("dead.sock");
         let _dgram = std::os::unix::net::UnixDatagram::bind(&dead).unwrap();
         assert_eq!(probe_wayland(&dead), WaylandStatus::Dead);
+
+        // Picking: the first live one wins; a dead one is reported only if
+        // nothing is live.
+        let missing = dir.join("missing.sock");
+        assert_eq!(
+            pick_wayland(&[missing.clone(), dead.clone(), sock.clone()]),
+            (WaylandStatus::Ready, Some(sock.clone()))
+        );
+        assert_eq!(pick_wayland(&[missing.clone(), dead.clone()]), (WaylandStatus::Dead, None));
+        assert_eq!(pick_wayland(&[missing]), (WaylandStatus::Missing, None));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
