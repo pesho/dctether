@@ -29,6 +29,7 @@ agent's `devcontainer exec` stdin/stdout.
 | `src/browser.rs` | URL validation (host) and the `BROWSER` helper (container) |
 | `src/gitcred.rs` | Git credential request validation and what `store`/`erase` may name (pure), and the helper (container) |
 | `src/sshagent.rs` | SSH agent request splitting and the allow-list of requests (pure) |
+| `src/netns.rs` | Proof that the container shares the host's network namespace (Linux only) |
 | `scripts/` | Static builds, packaging, formula rendering, changelog extraction |
 | `.github/workflows/release.yml` | Tag-triggered release and Homebrew tap update |
 | `packaging/homebrew/dctether.rb.in` | Formula template rendered at release time |

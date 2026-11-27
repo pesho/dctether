@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record of it, and requests are answered one at a time. A request for a
   credential may no longer carry a password. A password typed into a
   prompt inside the container is therefore no longer saved on the host.
+- X11: the host offered the direct path, and with it your real X cookie,
+  to any container whose agent reported the host's network namespace. A
+  modified agent in a container with its own network could claim that.
+  The container now has to prove it: the agent must connect to a randomly
+  named abstract socket on the host and present a one-time value, which
+  only a process in the host's network namespace can do. Otherwise X11
+  is relayed, as for any other container.
 - Data frames larger than 32 KiB are refused. The limit was 1 MiB,
   although neither side sends more than 32 KiB, so a channel's queue could
   be made to hold 32 times more than intended.

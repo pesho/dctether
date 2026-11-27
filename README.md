@@ -157,9 +157,14 @@ author's machine, and a third the first time a version is used.
 - **Direct.** dctether uses this when the container shares the host's
   network namespace (`--network=host`) and the host X server listens on
   an abstract socket (`@/tmp/.X11-unix/X<n>`, as Xorg and Xwayland do on
-  Linux). The container then reaches that socket itself. The agent
-  confirms this with a real X connection handshake (it opens no window),
-  then writes the host's MIT-MAGIC-COOKIE-1 into a private Xauthority
+  Linux). The container then reaches that socket itself. Before the
+  host hands over its cookie, the container has to show that it really is
+  on the host's network: the host listens on a randomly named abstract
+  socket, and the agent must connect to it and present a one-time value
+  sent over the pipe. Abstract sockets exist per network namespace, so a
+  container with its own network can't. The agent then confirms the
+  display with a real X connection handshake (it opens no window),
+  and writes the host's MIT-MAGIC-COOKIE-1 into a private Xauthority
   file (`/tmp/dctether-XXXX/Xauthority`, mode 0600) as a wildcard-family
   entry, and sets `DISPLAY=:<n>`. Nothing is relayed.
 - **Relay.** Otherwise the agent listens on `/tmp/.X11-unix/X<n>`, with
@@ -414,15 +419,17 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
   `--remote-env=K=V` argument.
 - The agent binary lives in the container user's home, so anything
   running as that user can replace it. The checks above don't depend on
-  the agent behaving. Two things do. The agent reports the network
-  namespace itself, so "the real cookie never enters the container" (relay
-  mode) holds only for an unmodified agent. A modified one could claim to
-  share the host's namespace and be offered the direct path, cookie
-  included. The agent also reports the container's ID, which names the
-  port forwarder that sessions on a container share. A modified one that
-  reported another container's ID could get that container's sessions to
-  use its forwarder, so that their forwarded ports lead to it instead
-  (from reading the code; not tested).
+  the agent behaving. "The real cookie never enters the container" (relay
+  mode) doesn't either: the agent reports its network namespace, but the
+  host offers the direct path, cookie included, only after the check
+  described under [X11](#x11-direct-and-relayed). What that check shows
+  is that the agent, or something it could pass the one-time value to, is
+  in the host's network namespace. One thing does depend on the agent:
+  it reports the container's ID, which names the port forwarder that
+  sessions on a container share. A modified agent that reported another
+  container's ID could get that container's sessions to use its
+  forwarder, so that their forwarded ports lead to it instead (from
+  reading the code; not tested).
 
 ## Platforms
 

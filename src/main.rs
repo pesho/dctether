@@ -15,6 +15,8 @@ mod xauth;
 
 #[cfg(target_os = "linux")]
 mod agent;
+#[cfg(target_os = "linux")]
+mod netns;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

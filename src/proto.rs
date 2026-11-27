@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the frame layout or the control messages change
 /// incompatibly. Both halves are always the same build in practice (the
 /// container half is copied by content hash), so this is a safety net.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub const HEADER_LEN: usize = 9;
 /// Largest payload either side accepts in a control frame (the handshake
@@ -115,13 +115,17 @@ pub enum Frame {
 
 /// Control messages, exchanged once at startup:
 /// agent → host `Hello`, host → agent `Setup`, agent → host `Ready`.
+/// Before `Setup` the host may send `NetnsProbe`, which the agent answers
+/// with `NetnsProbed`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
     Hello {
         protocol: u32,
         version: String,
-        /// `readlink /proc/self/ns/net` inside the container.
+        /// `readlink /proc/self/ns/net` inside the container. The agent's
+        /// word only: where it matters (the X cookie), the host checks it
+        /// with `NetnsProbe`.
         netns: Option<String>,
         /// Login shell of the container user, from the passwd database.
         shell: Option<String>,
@@ -130,6 +134,13 @@ pub enum Control {
         #[serde(default)]
         container_id: Option<String>,
     },
+    /// Host → agent: prove that you are in my network namespace by
+    /// connecting to this abstract Unix socket and writing `nonce` to it
+    /// (see `netns.rs`).
+    NetnsProbe { socket: String, nonce: Vec<u8> },
+    /// Agent → host: done trying. Says nothing about the outcome; the
+    /// host looks at its socket.
+    NetnsProbed,
     Setup(Setup),
     Ready {
         /// Environment for the user's `devcontainer exec`.
@@ -145,8 +156,9 @@ pub enum Control {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct X11Offer {
-    /// Offered only when the container shares the host's network namespace
-    /// and the host X server listens on an abstract socket.
+    /// Offered only when the container has shown that it shares the
+    /// host's network namespace (`NetnsProbe`) and the host X server
+    /// listens on an abstract socket.
     pub direct: Option<X11Direct>,
     /// Whether the agent may fall back to a relayed display.
     pub relay: bool,
@@ -406,6 +418,11 @@ mod tests {
         roundtrip(Frame::Control(Control::Error {
             message: "nope".into(),
         }));
+        roundtrip(Frame::Control(Control::NetnsProbe {
+            socket: "dctether-netns-0123".into(),
+            nonce: vec![0, 1, 255],
+        }));
+        roundtrip(Frame::Control(Control::NetnsProbed));
     }
 
     #[test]
