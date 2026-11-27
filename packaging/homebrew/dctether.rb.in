@@ -1,8 +1,9 @@
 class Dctether < Formula
   desc "Forward SSH agent, X11 and BROWSER into devcontainer exec sessions"
   homepage "https://github.com/pesho/dctether"
-  version "@VERSION@"
   license "MIT"
+
+  depends_on "devcontainer"
 
   on_macos do
     on_arm do
@@ -24,8 +25,6 @@ class Dctether < Formula
       sha256 "@SHA_LINUX_INTEL@"
     end
   end
-
-  depends_on "devcontainer"
 
   def install
     bin.install "bin/dctether"
