@@ -18,9 +18,15 @@ image or shell rc files. The environment is set only on dctether's own
 ## Usage
 
 ```sh
-dctether exec --workspace-folder ~/src/project              # interactive shell
-dctether exec --workspace-folder ~/src/project -- git push  # one command
+cd ~/src/project            # a folder whose dev container is running
+dctether exec               # interactive shell
+dctether exec -- git push   # one command
 ```
+
+Like `devcontainer exec`, dctether finds the container from the current
+directory, so no options are needed. To pick another container, add
+`--workspace-folder DIR` or `--container-id ID`. dctether doesn't start
+containers. Start one with `devcontainer up` or VS Code first.
 
 ```text
 dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
@@ -32,8 +38,8 @@ dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
 ```
 
 Everything before `--` that isn't one of these options goes to
-`devcontainer exec` unchanged: `--workspace-folder`, `--container-id`,
-`--config`, `--remote-env` and so on. Those must all be options. The
+`devcontainer exec` unchanged, for example `--workspace-folder`,
+`--container-id`, `--config` or `--remote-env`. Those must all be options. The
 command always goes after `--`. Without a command, dctether starts the
 container user's shell from `/etc/passwd`.
 
