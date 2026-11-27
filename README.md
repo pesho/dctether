@@ -341,10 +341,11 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
   in ssh-agent's manual). `--ssh-agent-unfiltered` relays everything, for
   example to run `ssh-add` in the container. The filter goes by the kind
   of request, so it can't allow one for `ssh-add` and refuse the same one
-  from another program. Tested with OpenSSH 10.2: `ssh-add -l` and
-  `ssh-keygen -Y sign` work in the container, and `ssh-add KEY`, `-d`,
-  `-D` and `-x` report that the agent refused. The `session-bind` case is
-  covered by a unit test only.
+  from another program. Tested with OpenSSH 10.0 and 10.2 in the
+  container: `ssh` logs in with a key from the host agent (binding the
+  session first), `git push` over SSH and `ssh -A` to a further host
+  work, as do `ssh-add -l` and `ssh-keygen -Y sign`; `ssh-add KEY`, `-d`,
+  `-D` and `-x` report that the agent refused.
 - **X11.** Any client on your X display can read keystrokes and screen
   contents of the other clients on that display, so granting the container
   the display grants that too. In direct mode the container gets your real
