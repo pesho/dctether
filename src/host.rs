@@ -171,10 +171,16 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
     let host_x11 = if a.x11 { HostX11::from_env() } else { None };
-    let offer = host_x11.as_ref().map(|hx| X11Offer {
-        direct: if a.force_relay { None } else { hx.direct_offer(netns.as_deref()) },
-        relay: true,
-    });
+    // The direct path hands over the real X cookie, so the namespace the
+    // agent reported is checked first.
+    let direct = match host_x11.as_ref().filter(|_| !a.force_relay) {
+        Some(hx) => match hx.direct_candidate(netns.as_deref()) {
+            Some(direct) => confirm_direct(direct, &out, &mut reader).await?,
+            None => None,
+        },
+        None => None,
+    };
+    let offer = host_x11.as_ref().map(|_| X11Offer { direct, relay: true });
     crate::debug!(
         "container netns {:?}; X11 {}",
         netns,
@@ -726,9 +732,11 @@ impl HostX11 {
 
     /// The direct path needs the container to share our network namespace
     /// (so it sees the same abstract sockets) and the X server to listen on
-    /// an abstract socket. The agent confirms with a real connection.
+    /// an abstract socket. `container_netns` is what the agent reported:
+    /// enough to rule the direct path out, not to offer it (see
+    /// `confirm_direct`).
     #[cfg(target_os = "linux")]
-    fn direct_offer(&self, container_netns: Option<&str>) -> Option<X11Direct> {
+    fn direct_candidate(&self, container_netns: Option<&str>) -> Option<X11Direct> {
         let Display::Local { number } = self.display else {
             return None;
         };
@@ -744,9 +752,48 @@ impl HostX11 {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn direct_offer(&self, _container_netns: Option<&str>) -> Option<X11Direct> {
+    fn direct_candidate(&self, _container_netns: Option<&str>) -> Option<X11Direct> {
         None
     }
+}
+
+/// Offer the direct X11 path only to a container that has shown it is in
+/// our network namespace: the agent must connect to an abstract socket we
+/// listen on and present a nonce (see `netns.rs`). The agent's own report
+/// can't be trusted with the X cookie. Anything short of proof means relay.
+#[cfg(target_os = "linux")]
+async fn confirm_direct(direct: X11Direct, out: &Out, reader: &mut AgentReader) -> Result<Option<X11Direct>, String> {
+    let probe = match crate::netns::Probe::new() {
+        Ok(probe) => probe,
+        Err(e) => {
+            crate::debug!("can't check the container's network namespace ({e}); relaying X11");
+            return Ok(None);
+        }
+    };
+    let ask = Control::NetnsProbe {
+        socket: probe.socket().to_string(),
+        nonce: probe.nonce().to_vec(),
+    };
+    send(out, Frame::Control(ask)).await?;
+    match reader.next().await {
+        // The agent has connected (or failed to) by now.
+        Ok(Some(Frame::Control(Control::NetnsProbed))) if probe.satisfied() => {
+            crate::debug!("the container showed that it shares the host's network namespace");
+            Ok(Some(direct))
+        }
+        Ok(Some(Frame::Control(Control::NetnsProbed))) => {
+            crate::debug!(
+                "the container reports the host's network namespace but couldn't reach a socket in it; relaying X11"
+            );
+            Ok(None)
+        }
+        other => Err(format!("container agent failed during setup ({})", describe(other))),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn confirm_direct(_: X11Direct, _: &Out, _: &mut AgentReader) -> Result<Option<X11Direct>, String> {
+    Ok(None)
 }
 
 fn hostname() -> Vec<u8> {

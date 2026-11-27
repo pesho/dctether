@@ -50,12 +50,20 @@ pub async fn main() -> i32 {
     };
     let _ = out.send(Frame::Control(hello)).await;
 
-    let setup = match reader.next().await {
-        Ok(Some(Frame::Control(Control::Setup(setup)))) => setup,
-        Ok(None) => return 0,
-        other => {
-            eprintln!("dctether agent: expected setup, got {other:?}");
-            return 1;
+    let setup = loop {
+        match reader.next().await {
+            Ok(Some(Frame::Control(Control::Setup(setup)))) => break setup,
+            // The host checks the network namespace reported above before
+            // it offers the direct X11 path.
+            Ok(Some(Frame::Control(Control::NetnsProbe { socket, nonce }))) => {
+                crate::netns::answer(&socket, &nonce);
+                let _ = out.send(Frame::Control(Control::NetnsProbed)).await;
+            }
+            Ok(None) => return 0,
+            other => {
+                eprintln!("dctether agent: expected setup, got {other:?}");
+                return 1;
+            }
         }
     };
 
@@ -483,13 +491,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     f.write_all(bytes)
 }
 
-fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn random_bytes(n: usize) -> io::Result<Vec<u8>> {
     let mut b = vec![0u8; n];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
     Ok(b)
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
