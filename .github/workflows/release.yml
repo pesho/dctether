@@ -16,7 +16,7 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
             --target x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
@@ -29,13 +29,13 @@ jobs:
             RUSTFLAGS="-C linker=rust-lld" cargo build --locked --release --target "$t"
             mkdir -p "build/$t" && cp "target/$t/release/dctether" "build/$t/"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with: { name: linux, path: build }
 
   macos:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
             --target aarch64-apple-darwin,x86_64-apple-darwin
@@ -46,7 +46,7 @@ jobs:
             cargo build --locked --release --target "$t"
             mkdir -p "build/$t" && cp "target/$t/release/dctether" "build/$t/"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with: { name: macos, path: build }
 
   release:
@@ -56,8 +56,8 @@ jobs:
       # Job-level, so the tap step's `if` can see whether it is set.
       TAP_TOKEN: "${{ secrets.TAP_TOKEN }}"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with: { path: build, merge-multiple: true }
       - name: Check tag matches Cargo.toml
         run: |
