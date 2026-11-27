@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-27
+
 ### Added
 
 - Git HTTPS credentials: git in the container asks your host's git
@@ -67,7 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release builds for Linux and macOS, and a Homebrew tap:
   `brew install pesho/tap/dctether`.
 
-[Unreleased]: https://github.com/pesho/dctether/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/pesho/dctether/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/pesho/dctether/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pesho/dctether/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pesho/dctether/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pesho/dctether/releases/tag/v0.1.0
