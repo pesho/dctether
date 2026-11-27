@@ -18,11 +18,16 @@ pub const CONTAINER_SOCKET: &str = "/tmp/dctether-wayland.sock";
 /// VS Code's Dev Containers extension mounts the host socket as
 /// `/tmp/vscode-wayland-<uuid>.sock`. That is its internal naming, not a
 /// documented interface; if it changes, the fallback simply finds nothing.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const VSCODE_PREFIX: &str = "vscode-wayland-";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const VSCODE_SUFFIX: &str = ".sock";
 
+/// Used by the (Linux-only) container agent.
+///
 /// Sockets to try in `dir` (the container's `/tmp`), in order: dctether's
 /// own mount, then VS Code's, sorted for a stable choice.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn candidates(dir: &Path) -> Vec<PathBuf> {
     let own = Path::new(CONTAINER_SOCKET).file_name().expect("constant has a file name");
     let mut vscode: Vec<PathBuf> = std::fs::read_dir(dir)

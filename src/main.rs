@@ -3,6 +3,7 @@
 //! `devcontainer exec` itself.
 
 mod browser;
+mod forward;
 mod host;
 mod mux;
 mod proto;
@@ -38,7 +39,9 @@ usage: dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]
 
 exec  Run COMMAND (default: the container user's shell from /etc/passwd) with
       `devcontainer exec`, forwarding the host's SSH agent, X11 display, browser
-      opener and (if the container was created by `dctether up`) Wayland into it.
+      opener and Wayland (if the container was created by `dctether up` or VS
+      Code) into it, and the container's ports to the host while any session
+      on that container runs.
 up    Run `devcontainer up`, also mounting the host's Wayland socket into the
       container. Mounts are fixed at creation: an existing container is reused
       as it is (add --remove-existing-container to recreate it).
@@ -53,6 +56,9 @@ exec options:
   --no-browser     don't set BROWSER
   --no-wayland     don't set WAYLAND_DISPLAY
   --x11-relay      always relay X11, even if the host display is reachable directly
+  -p PORT          also forward host 127.0.0.1:PORT to the container's PORT
+                   (forwardPorts from the configuration are forwarded by default)
+  --no-forward     don't forward any ports
 
 up options:
   --no-wayland     don't mount the Wayland socket
@@ -79,6 +85,8 @@ fn main() {
         match args.get(1).map(String::as_str) {
             Some("exec") => host::exec_main(&args[2..]),
             Some("up") => host::up_main(&args[2..]),
+            // Started by `exec`, not documented as a user command.
+            Some("forward") => forward::forwarder_main(&args[2..]),
             Some("agent") => agent_main(&args[2..]),
             Some("browser") => browser_helper(&args[2..]),
             Some("--version" | "-V") => {

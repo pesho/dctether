@@ -12,6 +12,8 @@ what a VS Code Dev Containers terminal gets:
   for example for OAuth logins started by CLIs in the container.
 - **Wayland**: `WAYLAND_DISPLAY` points at your host's compositor, if the
   container was created with `dctether up` (or by VS Code).
+- **Ports**: the container's `forwardPorts` (and any `-p PORT`) are
+  reachable on your host's `127.0.0.1` while a session runs.
 
 You don't need VS Code. Nothing is written to `devcontainer.json`, the
 image or shell rc files. The environment is set only on dctether's own
@@ -44,6 +46,8 @@ dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
   --no-browser     don't set BROWSER
   --no-wayland     don't set WAYLAND_DISPLAY
   --x11-relay      always relay X11, even if the host display is reachable directly
+  -p PORT          also forward host 127.0.0.1:PORT to the container's PORT
+  --no-forward     don't forward any ports
 
 dctether up [--no-wayland] [DEVCONTAINER-UP-OPTIONS]
 
@@ -65,7 +69,8 @@ Each forward is active only if the host has it: `SSH_AUTH_SOCK` must be
 set, `DISPLAY` must name a reachable X server, and for Wayland
 `WAYLAND_DISPLAY` must be set (and the container created by `dctether
 up` or VS Code). A forward stays up while the `dctether exec` session runs and ends
-with it; the Wayland mount lasts as long as the container.
+with it; the Wayland mount lasts as long as the container, and forwarded
+ports last while any session on the container runs.
 
 | Variable | Meaning |
 |---|---|
@@ -172,6 +177,38 @@ Caveats, and why it can be turned off (`--no-wayland` on `up` or `exec`):
 - **Same user ID.** Compositor sockets are usually accessible only to
   their owner, so the container user needs your host user ID (or root).
 
+### Ports: one forwarder per container
+
+`dctether exec` forwards the `forwardPorts` of the dev container
+configuration (read with `devcontainer read-configuration`), plus any
+ports given with `-p`. Host `127.0.0.1:<port>` then reaches port `<port>`
+on the container's own loopback, so services that listen only on the
+container's `127.0.0.1` work too. Entries naming another service, such as
+`"db:5432"`, are skipped with a message.
+
+All sessions on a container share one forwarder process
+(`dctether forward`, started by `exec`; you don't run it yourself):
+
+1. A session asks the forwarder for its ports through a control socket in
+   `$XDG_RUNTIME_DIR/dctether/`, named after the container's ID. If none
+   answers, the session starts it in the background, detached from the
+   terminal. A lock file ensures there is only ever one per container.
+2. The forwarder runs its own container agent and listens on the host
+   ports. Each connection becomes a channel to the agent, which connects
+   to the same port inside the container. The session prints which ports
+   it newly forwarded, and which it couldn't (for example because the
+   host port is already in use).
+3. Each session keeps its control connection open while it runs. The
+   kernel closes it when the session ends, however it ends. Five seconds
+   after the last session is gone, the forwarder stops and the ports
+   close.
+
+Ports are only added, never removed: a port one session added with `-p`
+stays forwarded until the last session ends. A container on the host's
+network (`--network=host`) already shares the host's ports, so dctether
+doesn't forward any there. Its log is
+`$XDG_RUNTIME_DIR/dctether/forward-<id>.log`.
+
 ### Async runtime
 
 dctether runs on [tokio](https://tokio.rs) with a single-threaded
@@ -214,12 +251,19 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`).
   spaces, at most 8 KiB long. It passes the URL to `xdg-open` (or `open` on
   macOS) as a single argument, never through a shell. A malicious container
   could still open unwanted web pages.
-- **No network listeners.** The agent listens only on filesystem Unix
-  sockets in the container, never on TCP or abstract sockets. Under
-  `--network=host` those would be reachable by every process on the host.
-  All traffic goes over the agent's own `devcontainer exec` pipe.
+- **No network listeners in the container.** The agent listens only on
+  filesystem Unix sockets in the container, never on TCP or abstract
+  sockets. Under `--network=host` those would be reachable by every
+  process on the host. All traffic goes over the agent's own
+  `devcontainer exec` pipe.
+- **Forwarded ports** listen on the host's `127.0.0.1`, so every local
+  process on the host can reach those container services, the same as with
+  VS Code's forwarding or Docker's `127.0.0.1` publishing. Only ports from
+  your configuration or your `-p` flags are forwarded; the container can't
+  ask for any.
 - The container chooses only a channel *kind* (SSH agent, X11, browser),
-  never a host path or address. The host refuses kinds it didn't offer,
+  never a host path or address. Port channels are opened by the host only.
+  The host refuses kinds it didn't offer,
   caps frames at 1 MiB and allows 256 channels at once.
 - The X cookie goes only through the protocol pipe, never on a command
   line. Host command lines (`ps`) show only the forwarded paths.
@@ -279,7 +323,11 @@ be resolved through mDNS or other NSS-only resolvers. `:0`, `unix:0` and
 
 ## Not supported (yet)
 
-- Git HTTPS credential helper, port forwarding, gpg agent, clipboard.
+- Git HTTPS credential helper, gpg agent.
+- Clipboard tools in the container (`xclip`, `wl-copy`) should work
+  through the X11 and Wayland forwards, but that hasn't been tested.
+- Automatic port detection (as VS Code does), and ports of other Compose
+  services (`"db:5432"`).
 - Forwards end with the `dctether exec` session. Background programs that
   outlive it lose them.
 - Flow control is a small bounded queue per channel. When one is full,

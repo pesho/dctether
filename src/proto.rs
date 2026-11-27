@@ -38,30 +38,46 @@ const T_DATA: u8 = 3;
 const T_EOF: u8 = 4;
 const T_CLOSE: u8 = 5;
 
-/// What a channel forwards. The container may only ask for one of these;
-/// it never names a host path or address.
+/// What a channel forwards. The container may only open the first three;
+/// it never names a host path or address. `Tcp` is opened by the host only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelKind {
     SshAgent,
     X11,
     Browser,
+    /// A forwarded port: the agent connects to this port on the
+    /// container's loopback.
+    Tcp(u16),
 }
 
+/// Channel ids chosen by the host have this bit set, ids chosen by the
+/// container don't, so the two sides never pick the same id.
+pub const HOST_CHANNEL_BIT: u32 = 0x8000_0000;
+
 impl ChannelKind {
-    fn to_byte(self) -> u8 {
+    fn encode(self) -> Vec<u8> {
         match self {
-            ChannelKind::SshAgent => 1,
-            ChannelKind::X11 => 2,
-            ChannelKind::Browser => 3,
+            ChannelKind::SshAgent => vec![1],
+            ChannelKind::X11 => vec![2],
+            ChannelKind::Browser => vec![3],
+            ChannelKind::Tcp(port) => {
+                let [hi, lo] = port.to_be_bytes();
+                vec![4, hi, lo]
+            }
         }
     }
 
-    fn from_byte(b: u8) -> Option<Self> {
+    fn decode(b: &[u8]) -> Result<Self, DecodeError> {
         match b {
-            1 => Some(ChannelKind::SshAgent),
-            2 => Some(ChannelKind::X11),
-            3 => Some(ChannelKind::Browser),
-            _ => None,
+            [1] => Ok(ChannelKind::SshAgent),
+            [2] => Ok(ChannelKind::X11),
+            [3] => Ok(ChannelKind::Browser),
+            [4, hi, lo] => match u16::from_be_bytes([*hi, *lo]) {
+                0 => Err(DecodeError::BadPayload("open")),
+                port => Ok(ChannelKind::Tcp(port)),
+            },
+            [k, ..] if !(1..=4).contains(k) => Err(DecodeError::UnknownChannelKind(*k)),
+            _ => Err(DecodeError::BadPayload("open")),
         }
     }
 }
@@ -70,8 +86,9 @@ impl ChannelKind {
 pub enum Frame {
     /// Handshake message on channel 0.
     Control(Control),
-    /// The container accepted a local connection and asks the host to
-    /// connect the matching host-side endpoint.
+    /// One side accepted a local connection and asks the other to connect
+    /// the matching endpoint: the container for SSH agent, X11 and browser
+    /// channels, the host for forwarded ports.
     Open { channel: u32, kind: ChannelKind },
     /// Bytes for a channel.
     Data { channel: u32, data: Vec<u8> },
@@ -93,6 +110,10 @@ pub enum Control {
         netns: Option<String>,
         /// Login shell of the container user, from the passwd database.
         shell: Option<String>,
+        /// Identifies the container (its runtime's container ID), so
+        /// sessions on the same container can share one port forwarder.
+        #[serde(default)]
+        container_id: Option<String>,
     },
     Setup {
         ssh_agent: bool,
@@ -188,7 +209,7 @@ pub fn encode(frame: &Frame, out: &mut BytesMut) {
             0,
             serde_json::to_vec(c).expect("control messages always serialize").into(),
         ),
-        Frame::Open { channel, kind } => (T_OPEN, *channel, vec![kind.to_byte()].into()),
+        Frame::Open { channel, kind } => (T_OPEN, *channel, kind.encode().into()),
         Frame::Data { channel, data } => (T_DATA, *channel, data.as_slice().into()),
         Frame::Eof { channel } => (T_EOF, *channel, (&[][..]).into()),
         Frame::Close { channel } => (T_CLOSE, *channel, (&[][..]).into()),
@@ -233,12 +254,13 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<Frame>, DecodeError> {
             Frame::Control(c)
         }
         T_OPEN => {
-            if payload.len() != 1 || channel == 0 {
+            if channel == 0 {
                 return Err(DecodeError::BadPayload("open"));
             }
-            let kind = ChannelKind::from_byte(payload[0])
-                .ok_or(DecodeError::UnknownChannelKind(payload[0]))?;
-            Frame::Open { channel, kind }
+            Frame::Open {
+                channel,
+                kind: ChannelKind::decode(&payload)?,
+            }
         }
         T_DATA => Frame::Data {
             channel,
@@ -293,6 +315,14 @@ mod tests {
             channel: u32::MAX,
             data: vec![],
         });
+        roundtrip(Frame::Open {
+            channel: HOST_CHANNEL_BIT | 1,
+            kind: ChannelKind::Tcp(3000),
+        });
+        roundtrip(Frame::Open {
+            channel: 10,
+            kind: ChannelKind::Tcp(65535),
+        });
         roundtrip(Frame::Eof { channel: 3 });
         roundtrip(Frame::Close { channel: 4 });
         roundtrip(Frame::Control(Control::Hello {
@@ -300,6 +330,7 @@ mod tests {
             version: "0.1.0".into(),
             netns: Some("net:[4026531833]".into()),
             shell: None,
+            container_id: Some("3b1c42e81917".into()),
         }));
         roundtrip(Frame::Control(Control::Setup {
             ssh_agent: true,
@@ -416,6 +447,25 @@ mod tests {
 
         let mut buf = BytesMut::from(&[T_OPEN, 0, 0, 0, 1, 0, 0, 0, 1, 77][..]);
         assert_eq!(decode(&mut buf), Err(DecodeError::UnknownChannelKind(77)));
+    }
+
+    #[test]
+    fn tcp_open_carries_port() {
+        let mut buf = BytesMut::new();
+        encode(
+            &Frame::Open {
+                channel: 7,
+                kind: ChannelKind::Tcp(0x1234),
+            },
+            &mut buf,
+        );
+        assert_eq!(&buf[..], &[T_OPEN, 0, 0, 0, 7, 0, 0, 0, 3, 4, 0x12, 0x34]);
+        // Port 0, a truncated port, and a port on a non-TCP kind are errors.
+        for bad in [&[4u8, 0, 0][..], &[4, 1], &[1, 0, 80]] {
+            let mut buf = BytesMut::from(&[T_OPEN, 0, 0, 0, 7, 0, 0, 0, bad.len() as u8][..]);
+            buf.put_slice(bad);
+            assert_eq!(decode(&mut buf), Err(DecodeError::BadPayload("open")), "{bad:?}");
+        }
     }
 
     #[test]

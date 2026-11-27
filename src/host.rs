@@ -23,7 +23,8 @@ use tokio::sync::mpsc;
 use crate::browser;
 use crate::mux::{self, ChanMsg, FrameReader, Out, Registry};
 use crate::proto::{
-    ChannelKind, Control, Frame, PROTOCOL_VERSION, WaylandStatus, X11Direct, X11Offer, X11Ready, XAuthCookie,
+    ChannelKind, Control, Frame, HOST_CHANNEL_BIT, PROTOCOL_VERSION, WaylandStatus, X11Direct, X11Offer, X11Ready,
+    XAuthCookie,
 };
 use crate::x11::ClientFilter;
 use crate::xauth::{self, Display};
@@ -41,12 +42,16 @@ pub struct ExecArgs {
     pub browser: bool,
     pub wayland: bool,
     pub force_relay: bool,
+    /// Forward `forwardPorts` and `ports`.
+    pub forward: bool,
+    /// From `-p PORT`.
+    pub ports: Vec<u16>,
 }
 
 /// `[options and devcontainer-exec options…] [-- cmd…]`. dctether's own
 /// options are recognized anywhere before `--`; everything else there is
 /// passed to `devcontainer exec` untouched.
-pub fn parse_exec_args(args: &[String]) -> ExecArgs {
+pub fn parse_exec_args(args: &[String]) -> Result<ExecArgs, String> {
     let (before, cmd) = match args.iter().position(|a| a == "--") {
         Some(i) => (&args[..i], args[i + 1..].to_vec()),
         None => (args, vec![]),
@@ -59,22 +64,36 @@ pub fn parse_exec_args(args: &[String]) -> ExecArgs {
         browser: true,
         wayland: true,
         force_relay: false,
+        forward: true,
+        ports: vec![],
     };
-    for arg in before {
+    let mut it = before.iter();
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "--no-ssh-agent" => a.ssh_agent = false,
             "--no-x11" => a.x11 = false,
             "--no-browser" => a.browser = false,
             "--no-wayland" => a.wayland = false,
+            "--no-forward" => a.forward = false,
             "--x11-relay" => a.force_relay = true,
+            "-p" => {
+                let v = it.next().ok_or("-p needs a port number")?;
+                a.ports.push(crate::forward::parse_port(v).ok_or_else(|| format!("-p: bad port {v:?}"))?);
+            }
             _ => a.dc_args.push(arg.clone()),
         }
     }
-    a
+    Ok(a)
 }
 
 pub fn exec_main(args: &[String]) -> i32 {
-    let a = parse_exec_args(args);
+    let a = match parse_exec_args(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("dctether: {e}");
+            return 2;
+        }
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -92,24 +111,42 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     let dc = std::env::var("DCTETHER_DEVCONTAINER").unwrap_or_else(|_| "devcontainer".into());
     let bins = locate_binaries()?;
 
+    // `forwardPorts` comes from the configuration on the host; read it while
+    // the agent starts.
+    let config = a.forward.then(|| {
+        let dc = dc.clone();
+        let rc_args = crate::forward::read_configuration_args(&a.dc_args);
+        tokio::spawn(async move {
+            Command::new(&dc)
+                .arg("read-configuration")
+                .arg("--include-merged-configuration")
+                .args(&rc_args)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .await
+        })
+    });
+
     let (mut agent, mut reader, stdin) = start_agent(&dc, &a.dc_args, &bins).await?;
     let (out, out_rx) = mpsc::channel::<Frame>(64);
     let writer = tokio::spawn(mux::write_frames(stdin, out_rx));
 
     // Handshake.
-    let (netns, shell) = match reader.next().await {
+    let (netns, shell, container_id) = match reader.next().await {
         Ok(Some(Frame::Control(Control::Hello {
             protocol,
             version,
             netns,
             shell,
+            container_id,
         }))) => {
             if protocol != PROTOCOL_VERSION {
                 return Err(format!(
                     "container agent {version} speaks protocol {protocol}, expected {PROTOCOL_VERSION}"
                 ));
             }
-            (netns, shell)
+            (netns, shell, container_id)
         }
         other => return Err(format!("container agent did not start ({})", describe(other))),
     };
@@ -184,6 +221,13 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     });
     let reg = Arc::new(Registry::default());
     let mut relay_task = tokio::spawn(host_read_loop(reader, reg, out.clone(), ctx));
+
+    // Ports. Held for the whole session: the open connection is what keeps
+    // the container's port forwarder alive.
+    let _forwarder = match config {
+        Some(config) => forward_ports(&a, config, netns.as_deref(), container_id.as_deref()).await,
+        None => None,
+    };
 
     // The user's command.
     let cmd = if a.cmd.is_empty() {
@@ -321,13 +365,87 @@ fn is_socket(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.file_type().is_socket())
 }
 
-async fn send(out: &Out, f: Frame) -> Result<(), String> {
+type ConfigTask = tokio::task::JoinHandle<io::Result<std::process::Output>>;
+
+/// Make the container's port forwarder forward `forwardPorts` plus `-p`
+/// ports, and report what happened. Problems are reported, not fatal: the
+/// session itself still works.
+async fn forward_ports(
+    a: &ExecArgs,
+    config: ConfigTask,
+    netns: Option<&str>,
+    container_id: Option<&str>,
+) -> Option<UnixStream> {
+    let mut ports = vec![];
+    match config.await {
+        Ok(Ok(o)) if o.status.success() => match crate::forward::config_ports(&String::from_utf8_lossy(&o.stdout)) {
+            Ok((p, skipped)) => {
+                ports = p;
+                for s in skipped {
+                    eprintln!("dctether: can't forward {s:?} from forwardPorts (only port numbers are supported)");
+                }
+            }
+            Err(e) => eprintln!("dctether: {e}"),
+        },
+        Ok(Ok(o)) => crate::debug!("read-configuration failed ({}); using only -p ports", o.status),
+        Ok(Err(e)) => crate::debug!("read-configuration: {e}; using only -p ports"),
+        Err(e) => crate::debug!("read-configuration: {e}"),
+    }
+    for p in &a.ports {
+        if !ports.contains(p) {
+            ports.push(*p);
+        }
+    }
+    if ports.is_empty() {
+        return None;
+    }
+    // A container in our network namespace already shares our ports;
+    // listening on them here would only take them away from it.
+    if netns.is_some() && netns == host_netns().as_deref() {
+        let msg = "the container shares the host's network, so its ports are reachable directly; not forwarding";
+        if a.ports.is_empty() {
+            crate::debug!("{msg}");
+        } else {
+            eprintln!("dctether: {msg}");
+        }
+        return None;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let key = crate::forward::forwarder_key(container_id, &cwd, &a.dc_args);
+    match crate::forward::attach(&key, &a.dc_args, &ports).await {
+        Ok((stream, results)) => {
+            for r in results {
+                match r {
+                    crate::forward::PortResult::New(p) => eprintln!("dctether: forwarding 127.0.0.1:{p} to the container"),
+                    crate::forward::PortResult::Active(p) => crate::debug!("port {p} already forwarded"),
+                    crate::forward::PortResult::Failed(p, e) => eprintln!("dctether: can't forward port {p}: {e}"),
+                }
+            }
+            Some(stream)
+        }
+        Err(e) => {
+            eprintln!("dctether: {e}");
+            None
+        }
+    }
+}
+
+/// This process's network namespace, as the agent reports the container's.
+fn host_netns() -> Option<String> {
+    if cfg!(target_os = "linux") {
+        std::fs::read_link("/proc/self/ns/net").ok()?.to_str().map(str::to_string)
+    } else {
+        None
+    }
+}
+
+pub(crate) async fn send(out: &Out, f: Frame) -> Result<(), String> {
     out.send(f)
         .await
         .map_err(|_| "container agent pipe closed".to_string())
 }
 
-fn describe(r: io::Result<Option<Frame>>) -> String {
+pub(crate) fn describe(r: io::Result<Option<Frame>>) -> String {
     match r {
         Ok(None) => "it exited".into(),
         Ok(Some(f)) => format!("unexpected {f:?}"),
@@ -390,7 +508,7 @@ impl AgentBinary {
 /// `$DCTETHER_AGENT_DIR`, then `<prefix>/libexec/dctether` next to this
 /// executable; a static Linux build of the same architecture also serves
 /// as its own container half.
-fn locate_binaries() -> Result<Vec<AgentBinary>, String> {
+pub(crate) fn locate_binaries() -> Result<Vec<AgentBinary>, String> {
     let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
     let mut dirs = vec![];
     if let Some(d) = std::env::var_os("DCTETHER_AGENT_DIR") {
@@ -463,9 +581,9 @@ pub fn upload_script(name: &str, size: usize) -> String {
     )
 }
 
-type AgentReader = FrameReader<BufReader<ChildStdout>>;
+pub(crate) type AgentReader = FrameReader<BufReader<ChildStdout>>;
 
-async fn start_agent(
+pub(crate) async fn start_agent(
     dc: &str,
     dc_args: &[String],
     bins: &[AgentBinary],
@@ -642,14 +760,26 @@ struct X11Relay {
     real: (Vec<u8>, Vec<u8>),
 }
 
-struct HostCtx {
+pub(crate) struct HostCtx {
     ssh_sock: Option<PathBuf>,
     relay: Option<X11Relay>,
     browser: bool,
 }
 
+impl HostCtx {
+    /// Refuses every container-opened channel (the port forwarder's agent
+    /// only carries host-opened ones).
+    pub(crate) fn none() -> HostCtx {
+        HostCtx {
+            ssh_sock: None,
+            relay: None,
+            browser: false,
+        }
+    }
+}
+
 /// Handle frames from the agent until it goes away.
-async fn host_read_loop(mut reader: AgentReader, reg: Arc<Registry>, out: Out, ctx: Arc<HostCtx>) -> String {
+pub(crate) async fn host_read_loop(mut reader: AgentReader, reg: Arc<Registry>, out: Out, ctx: Arc<HostCtx>) -> String {
     loop {
         let frame = match reader.next().await {
             Ok(Some(f)) => f,
@@ -668,11 +798,15 @@ async fn host_read_loop(mut reader: AgentReader, reg: Arc<Registry>, out: Out, c
 }
 
 async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out, ctx: &Arc<HostCtx>) {
-    let allowed = match kind {
-        ChannelKind::SshAgent => ctx.ssh_sock.is_some(),
-        ChannelKind::X11 => ctx.relay.is_some(),
-        ChannelKind::Browser => ctx.browser,
-    };
+    // Forwarded ports are opened by the host only, and host-chosen ids are
+    // the host's: the container may use neither.
+    let allowed = id & HOST_CHANNEL_BIT == 0
+        && match kind {
+            ChannelKind::SshAgent => ctx.ssh_sock.is_some(),
+            ChannelKind::X11 => ctx.relay.is_some(),
+            ChannelKind::Browser => ctx.browser,
+            ChannelKind::Tcp(_) => false,
+        };
     if reg.contains(id) {
         crate::debug!("container reused open channel id {id}; ignoring");
         return;
@@ -711,6 +845,7 @@ async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out
                 }
             }
             ChannelKind::Browser => browser_channel(id, inbox, out.clone(), reg.clone()).await,
+            ChannelKind::Tcp(_) => unreachable!("refused above"),
         }
     });
 }
@@ -791,18 +926,27 @@ mod tests {
             "--",
             "git",
             "--no-x11",
-        ]));
+        ])).unwrap();
         assert_eq!(a.dc_args, s(&["--workspace-folder", "/w", "--remote-env", "A=B"]));
         assert_eq!(a.cmd, s(&["git", "--no-x11"]));
         assert!(!a.x11 && a.ssh_agent && a.browser && !a.force_relay);
 
-        let a = parse_exec_args(&s(&["--x11-relay", "--no-browser", "--no-ssh-agent"]));
+        let a = parse_exec_args(&s(&["--x11-relay", "--no-browser", "--no-ssh-agent"])).unwrap();
         assert!(a.dc_args.is_empty() && a.cmd.is_empty());
         assert!(a.x11 && a.force_relay && !a.browser && !a.ssh_agent && a.wayland);
 
-        let a = parse_exec_args(&s(&["--no-wayland", "--", "--no-wayland"]));
+        let a = parse_exec_args(&s(&["--no-wayland", "--", "--no-wayland"])).unwrap();
         assert!(!a.wayland && a.dc_args.is_empty());
         assert_eq!(a.cmd, s(&["--no-wayland"]));
+
+        let a = parse_exec_args(&s(&["-p", "3000", "--workspace-folder", "/w", "-p", "8080"])).unwrap();
+        assert_eq!(a.ports, vec![3000, 8080]);
+        assert_eq!(a.dc_args, s(&["--workspace-folder", "/w"]));
+        assert!(a.forward);
+        assert!(!parse_exec_args(&s(&["--no-forward"])).unwrap().forward);
+        assert!(parse_exec_args(&s(&["-p"])).is_err());
+        assert!(parse_exec_args(&s(&["-p", "0"])).is_err());
+        assert!(parse_exec_args(&s(&["-p", "http"])).is_err());
     }
 
     #[test]

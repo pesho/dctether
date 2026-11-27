@@ -20,7 +20,8 @@ use tokio::sync::mpsc;
 
 use crate::mux::{self, FrameReader, Out, Registry};
 use crate::proto::{
-    ChannelKind, Control, Frame, PROTOCOL_VERSION, WaylandStatus, X11Direct, X11Offer, X11Ready, XAuthCookie,
+    ChannelKind, Control, Frame, HOST_CHANNEL_BIT, PROTOCOL_VERSION, WaylandStatus, X11Direct, X11Offer, X11Ready,
+    XAuthCookie,
 };
 use crate::xauth;
 
@@ -43,6 +44,9 @@ pub async fn main() -> i32 {
             .ok()
             .map(|p| p.to_string_lossy().into_owned()),
         shell: login_shell(),
+        container_id: std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|m| container_id_from_mountinfo(&m)),
     };
     let _ = out.send(Frame::Control(hello)).await;
 
@@ -91,7 +95,7 @@ pub async fn main() -> i32 {
     let mut hup = signal(SignalKind::hangup()).expect("signal handler");
     let mut int = signal(SignalKind::interrupt()).expect("signal handler");
     let status = tokio::select! {
-        s = read_loop(&mut reader, &reg) => s,
+        s = read_loop(&mut reader, &reg, &out) => s,
         _ = term.recv() => 0,
         _ = hup.recv() => 0,
         _ = int.recv() => 0,
@@ -100,9 +104,14 @@ pub async fn main() -> i32 {
     status
 }
 
-async fn read_loop<R: tokio::io::AsyncRead + Unpin>(reader: &mut FrameReader<R>, reg: &Registry) -> i32 {
+async fn read_loop<R: tokio::io::AsyncRead + Unpin>(reader: &mut FrameReader<R>, reg: &Arc<Registry>, out: &Out) -> i32 {
     loop {
         match reader.next().await {
+            // A forwarded port: the host accepted a connection on its side.
+            Ok(Some(Frame::Open {
+                channel,
+                kind: ChannelKind::Tcp(port),
+            })) if channel & HOST_CHANNEL_BIT != 0 => open_tcp(channel, port, reg, out),
             Ok(Some(f)) => {
                 if !reg.dispatch(f).await {
                     eprintln!("dctether agent: unexpected frame from host");
@@ -119,6 +128,51 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(reader: &mut FrameReader<R>,
     }
 }
 
+/// Connect a host-opened channel to `port` on the container's loopback,
+/// IPv4 first, then IPv6.
+fn open_tcp(id: u32, port: u16, reg: &Arc<Registry>, out: &Out) {
+    let Some(inbox) = reg.insert(id) else {
+        let out = out.clone();
+        tokio::spawn(async move { out.send(Frame::Close { channel: id }).await });
+        return;
+    };
+    let (reg, out) = (reg.clone(), out.clone());
+    tokio::spawn(async move {
+        let v4 = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+        let stream = match tokio::net::TcpStream::connect(v4).await {
+            Ok(s) => Ok(s),
+            Err(_) => tokio::net::TcpStream::connect(v6).await,
+        };
+        match stream {
+            Ok(s) => mux::pump(id, s, inbox, out, reg, None).await,
+            Err(e) => {
+                crate::debug!("port {port}: {e}");
+                reg.remove(id);
+                let _ = out.send(Frame::Close { channel: id }).await;
+            }
+        }
+    });
+}
+
+/// The container's ID as its runtime knows it: Docker and Podman
+/// bind-mount `/etc/hostname` from a per-container directory named by the
+/// 64-hex-digit container ID.
+fn container_id_from_mountinfo(mountinfo: &str) -> Option<String> {
+    mountinfo.lines().find_map(|line| {
+        let f: Vec<&str> = line.split(' ').collect();
+        // Field 4 is the mount's root within its filesystem, field 5 the
+        // mount point.
+        if f.get(4) != Some(&"/etc/hostname") {
+            return None;
+        }
+        f.get(3)?
+            .split('/')
+            .find(|c| c.len() == 64 && c.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_string)
+    })
+}
+
 async fn accept_loop(listener: UnixListener, kind: ChannelKind, out: Out, reg: Arc<Registry>, next_id: Arc<AtomicU32>) {
     loop {
         let stream = match listener.accept().await {
@@ -130,7 +184,8 @@ async fn accept_loop(listener: UnixListener, kind: ChannelKind, out: Out, reg: A
             }
         };
         let id = loop {
-            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            // Container-chosen ids never have the host bit set.
+            let id = next_id.fetch_add(1, Ordering::Relaxed) & !HOST_CHANNEL_BIT;
             if id != 0 && !reg.contains(id) {
                 break id;
             }
@@ -414,6 +469,25 @@ mod tests {
         assert_eq!(pick_wayland(&[missing.clone(), dead.clone()]), (WaylandStatus::Dead, None));
         assert_eq!(pick_wayland(&[missing]), (WaylandStatus::Missing, None));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finds_container_id_in_mountinfo() {
+        let id = "3b1c42e819173cead180a3085232101a7ee9d9602f9895631d8454ebdef96f34";
+        let docker = format!(
+            "4278 4269 0:39 /root/var/lib/docker/containers/{id}/resolv.conf /etc/resolv.conf rw - btrfs /dev/x rw\n\
+             4279 4269 0:39 /root/var/lib/docker/containers/{id}/hostname /etc/hostname rw,relatime - btrfs /dev/x rw\n"
+        );
+        assert_eq!(container_id_from_mountinfo(&docker).as_deref(), Some(id));
+        let podman = format!(
+            "100 90 0:50 /containers/storage/overlay-containers/{id}/userdata/hostname /etc/hostname rw - tmpfs tmpfs rw\n"
+        );
+        assert_eq!(container_id_from_mountinfo(&podman).as_deref(), Some(id));
+        assert_eq!(container_id_from_mountinfo("1 0 0:1 / / rw - overlay overlay rw\n"), None);
+        assert_eq!(
+            container_id_from_mountinfo("5 1 0:2 /some/short/hostname /etc/hostname rw - tmpfs t rw\n"),
+            None
+        );
     }
 
     #[test]
