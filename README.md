@@ -232,7 +232,10 @@ accepted.
   provides for forwarding to other machines. The agent runs connections
   on it in restricted mode (see `--extra-socket` in gpg-agent's manual
   for what that excludes). Signing and decryption work, with passphrases
-  asked for by your host's pinentry.
+  asked for by your host's pinentry. Tested with `gpg --clearsign` and
+  `git commit -S`. gpg may print `problem with fast path key listing:
+  Forbidden - ignored`: a shortcut the restricted socket refuses, after
+  which gpg carries on normally.
 - `pubring.gpg`, the public parts of your host's secret keys (from
   `gpg --export`), which gpg needs to know which keys the agent holds.
 - `common.conf`, so that gpg uses that keyring file rather than keyboxd.
