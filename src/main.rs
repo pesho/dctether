@@ -8,6 +8,7 @@ mod gitcred;
 mod host;
 mod mux;
 mod proto;
+mod sshagent;
 mod wayland;
 mod x11;
 mod xauth;
@@ -53,6 +54,8 @@ Without them, devcontainer uses the dev container of the current directory.
 
 exec options:
   --no-ssh-agent   don't forward $SSH_AUTH_SOCK
+  --ssh-agent-unfiltered  let the container also add, remove and lock keys in
+                   your SSH agent (default: it can only list keys and sign)
   --no-x11         don't forward $DISPLAY
   --no-browser     don't set BROWSER
   --no-wayland     don't set WAYLAND_DISPLAY

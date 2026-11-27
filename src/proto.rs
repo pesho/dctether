@@ -26,11 +26,18 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub const HEADER_LEN: usize = 9;
-/// Largest payload either side accepts. Data frames are produced in chunks of
-/// at most [`DATA_CHUNK`] bytes; anything larger is a protocol violation.
+/// Largest payload either side accepts in a control frame (the handshake
+/// can carry a gpg key export).
 pub const MAX_PAYLOAD: usize = 1 << 20;
-/// Size of the read buffer used when relaying a socket into data frames.
+/// Largest payload of a data frame, and the size of the read buffer used
+/// when relaying a socket into data frames. A larger data frame is a
+/// protocol violation, which bounds what a channel's queue can hold.
 pub const DATA_CHUNK: usize = 32 * 1024;
+
+/// Largest payload accepted for a frame of type `ty`.
+fn max_payload(ty: u8) -> usize {
+    if ty == T_DATA { DATA_CHUNK } else { MAX_PAYLOAD }
+}
 
 const T_CONTROL: u8 = 1;
 const T_OPEN: u8 = 2;
@@ -239,7 +246,7 @@ pub fn encode(frame: &Frame, out: &mut BytesMut) {
         Frame::Eof { channel } => (T_EOF, *channel, (&[][..]).into()),
         Frame::Close { channel } => (T_CLOSE, *channel, (&[][..]).into()),
     };
-    debug_assert!(payload.len() <= MAX_PAYLOAD);
+    debug_assert!(payload.len() <= max_payload(ty));
     out.reserve(HEADER_LEN + payload.len());
     out.put_u8(ty);
     out.put_u32(channel);
@@ -258,11 +265,12 @@ pub fn decode(buf: &mut BytesMut) -> Result<Option<Frame>, DecodeError> {
     let ty = buf[0];
     let channel = u32::from_be_bytes(buf[1..5].try_into().unwrap());
     let len = u32::from_be_bytes(buf[5..9].try_into().unwrap()) as usize;
-    if len > MAX_PAYLOAD {
-        return Err(DecodeError::TooLarge(len));
-    }
     if !matches!(ty, T_CONTROL | T_OPEN | T_DATA | T_EOF | T_CLOSE) {
         return Err(DecodeError::UnknownType(ty));
+    }
+    // Checked from the header alone, before any of the payload is buffered.
+    if len > max_payload(ty) {
+        return Err(DecodeError::TooLarge(len));
     }
     if buf.len() < HEADER_LEN + len {
         return Ok(None);
@@ -477,9 +485,24 @@ mod tests {
 
     #[test]
     fn rejects_oversized_frame_from_header_alone() {
+        // Data frames: at most DATA_CHUNK.
         let mut buf = BytesMut::new();
         buf.put_u8(T_DATA);
         buf.put_u32(1);
+        buf.put_u32((DATA_CHUNK + 1) as u32);
+        assert_eq!(decode(&mut buf), Err(DecodeError::TooLarge(DATA_CHUNK + 1)));
+        roundtrip(Frame::Data {
+            channel: 1,
+            data: vec![7; DATA_CHUNK],
+        });
+
+        // Control frames may be larger (the gpg key export), up to MAX_PAYLOAD.
+        roundtrip(Frame::Control(Control::Error {
+            message: "x".repeat(DATA_CHUNK + 1),
+        }));
+        let mut buf = BytesMut::new();
+        buf.put_u8(T_CONTROL);
+        buf.put_u32(0);
         buf.put_u32((MAX_PAYLOAD + 1) as u32);
         assert_eq!(decode(&mut buf), Err(DecodeError::TooLarge(MAX_PAYLOAD + 1)));
     }

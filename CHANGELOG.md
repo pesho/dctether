@@ -16,6 +16,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the host run that command. The host's git now runs in `/`, so it no
   longer reads the workspace's repository configuration. Affects 0.4.0;
   there, `--no-git-credentials` avoids it.
+- SSH agent: the container could send your agent any request, so besides
+  signing it could add keys, remove or lock yours, and ask the agent to
+  load PKCS#11/FIDO provider libraries. The host now passes on only the
+  requests to list keys and to sign (and ssh's `session-bind` extension)
+  and answers the rest with a failure. `ssh-add` in the container
+  therefore no longer changes your host agent, unless you start the
+  session with the new `--ssh-agent-unfiltered`.
+- Git HTTPS credentials: the container could have your host's git store a
+  credential of its choosing for any `http(s)` host, or erase a stored
+  one. `store` and `erase` are now carried out only for a credential the
+  host handed to the container in the same session, using the host's own
+  record of it, and requests are answered one at a time. A request for a
+  credential may no longer carry a password. A password typed into a
+  prompt inside the container is therefore no longer saved on the host.
+- Data frames larger than 32 KiB are refused. The limit was 1 MiB,
+  although neither side sends more than 32 KiB, so a channel's queue could
+  be made to hold 32 times more than intended.
+
+### Changed
+
+- README, Security section: it said the container can't get ports
+  forwarded. It can't over the protocol, but it can usually edit
+  `forwardPorts` in `devcontainer.json`, which the next session reads.
+  Also added: the same file lets it read host environment variables
+  through `remoteEnv`, and the port forwarder's name depends on the
+  container ID that the agent reports.
 
 ## [0.4.0] - 2026-11-27
 

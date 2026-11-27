@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 use crate::browser;
 use crate::mux::{self, ChanMsg, FrameReader, Out, Registry};
 use crate::proto::{
-    ChannelKind, Control, Frame, GpgOffer, HOST_CHANNEL_BIT, PROTOCOL_VERSION, Setup, WaylandStatus, X11Direct,
-    X11Offer, X11Ready, XAuthCookie,
+    ChannelKind, Control, DATA_CHUNK, Frame, GpgOffer, HOST_CHANNEL_BIT, PROTOCOL_VERSION, Setup, WaylandStatus,
+    X11Direct, X11Offer, X11Ready, XAuthCookie,
 };
 use crate::x11::ClientFilter;
 use crate::xauth::{self, Display};
@@ -38,6 +38,8 @@ pub struct ExecArgs {
     pub dc_args: Vec<String>,
     pub cmd: Vec<String>,
     pub ssh_agent: bool,
+    /// Relay every SSH agent request, not only listing and signing.
+    pub ssh_agent_unfiltered: bool,
     pub x11: bool,
     pub browser: bool,
     pub wayland: bool,
@@ -62,6 +64,7 @@ pub fn parse_exec_args(args: &[String]) -> Result<ExecArgs, String> {
         dc_args: vec![],
         cmd,
         ssh_agent: true,
+        ssh_agent_unfiltered: false,
         x11: true,
         browser: true,
         wayland: true,
@@ -75,6 +78,7 @@ pub fn parse_exec_args(args: &[String]) -> Result<ExecArgs, String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--no-ssh-agent" => a.ssh_agent = false,
+            "--ssh-agent-unfiltered" => a.ssh_agent_unfiltered = true,
             "--no-x11" => a.x11 = false,
             "--no-browser" => a.browser = false,
             "--no-wayland" => a.wayland = false,
@@ -234,9 +238,10 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     };
     let ctx = Arc::new(HostCtx {
         ssh_sock,
+        ssh_filter: !a.ssh_agent_unfiltered,
         relay,
         browser: a.browser,
-        git_credentials,
+        git: git_credentials.then(Default::default),
         gpg_socket: gpg.map(|g| g.extra_socket),
     });
     let reg = Arc::new(Registry::default());
@@ -790,9 +795,13 @@ struct X11Relay {
 
 pub(crate) struct HostCtx {
     ssh_sock: Option<PathBuf>,
+    /// Pass on only the agent requests in `sshagent::allowed`.
+    ssh_filter: bool,
     relay: Option<X11Relay>,
     browser: bool,
-    git_credentials: bool,
+    /// `Some` when git credentials are forwarded: what this session handed
+    /// out. The lock also makes requests take turns.
+    git: Option<tokio::sync::Mutex<crate::gitcred::Served>>,
     /// The host gpg-agent's extra socket.
     gpg_socket: Option<PathBuf>,
 }
@@ -803,9 +812,10 @@ impl HostCtx {
     pub(crate) fn none() -> HostCtx {
         HostCtx {
             ssh_sock: None,
+            ssh_filter: true,
             relay: None,
             browser: false,
-            git_credentials: false,
+            git: None,
             gpg_socket: None,
         }
     }
@@ -838,7 +848,7 @@ async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out
             ChannelKind::SshAgent => ctx.ssh_sock.is_some(),
             ChannelKind::X11 => ctx.relay.is_some(),
             ChannelKind::Browser => ctx.browser,
-            ChannelKind::GitCredential => ctx.git_credentials,
+            ChannelKind::GitCredential => ctx.git.is_some(),
             ChannelKind::GpgAgent => ctx.gpg_socket.is_some(),
             ChannelKind::Tcp(_) => false,
         };
@@ -866,6 +876,7 @@ async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out
         };
         match kind {
             ChannelKind::SshAgent => match UnixStream::connect(ctx.ssh_sock.as_ref().unwrap()).await {
+                Ok(s) if ctx.ssh_filter => ssh_agent_channel(id, s, inbox, out.clone(), reg.clone()).await,
                 Ok(s) => mux::pump(id, s, inbox, out.clone(), reg.clone(), None).await,
                 Err(e) => fail(e).await,
             },
@@ -880,7 +891,7 @@ async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out
                 }
             }
             ChannelKind::Browser => browser_channel(id, inbox, out.clone(), reg.clone()).await,
-            ChannelKind::GitCredential => git_credential_channel(id, inbox, out.clone(), reg.clone()).await,
+            ChannelKind::GitCredential => git_credential_channel(id, inbox, out.clone(), reg.clone(), &ctx).await,
             ChannelKind::GpgAgent => match UnixStream::connect(ctx.gpg_socket.as_ref().unwrap()).await {
                 Ok(s) => mux::pump(id, s, inbox, out.clone(), reg.clone(), None).await,
                 Err(e) => fail(e).await,
@@ -890,11 +901,100 @@ async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out
     });
 }
 
+/// Send `bytes` on a channel, in data frames no larger than the protocol
+/// allows. False when the pipe to the agent is gone.
+async fn send_data(out: &Out, id: u32, bytes: &[u8]) -> bool {
+    for chunk in bytes.chunks(DATA_CHUNK) {
+        let data = chunk.to_vec();
+        if out.send(Frame::Data { channel: id, data }).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Relay SSH agent requests one at a time. A request the container may
+/// make (`sshagent::allowed`) goes to the agent and its one reply comes
+/// back. Any other is answered with a failure here and never reaches the
+/// agent.
+async fn ssh_agent_channel(
+    id: u32,
+    mut agent: UnixStream,
+    mut inbox: mpsc::Receiver<ChanMsg>,
+    out: Out,
+    reg: Arc<Registry>,
+) {
+    let mut requests = crate::sshagent::Requests::default();
+    let clean = 'channel: loop {
+        loop {
+            let result = match requests.take() {
+                Ok(None) => break,
+                Ok(Some(request)) if crate::sshagent::allowed(&request) => {
+                    relay_agent_request(&mut agent, &request, id, &out).await
+                }
+                Ok(Some(request)) => {
+                    crate::debug!("channel {id}: refused SSH agent request of type {}", request[4]);
+                    send_data(&out, id, &crate::sshagent::FAILURE_REPLY)
+                        .await
+                        .then_some(())
+                        .ok_or_else(|| io::ErrorKind::BrokenPipe.into())
+                }
+                Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            };
+            if let Err(e) = result {
+                crate::debug!("channel {id} (SSH agent): {e}");
+                break 'channel false;
+            }
+        }
+        match inbox.recv().await {
+            Some(ChanMsg::Data(d)) => requests.push(&d),
+            // A clean end, unless it cuts a request short.
+            Some(ChanMsg::Eof) => break requests.is_empty(),
+            // Closed by the container.
+            None => return,
+        }
+    };
+    reg.remove(id);
+    let end = if clean { Frame::Eof { channel: id } } else { Frame::Close { channel: id } };
+    let _ = out.send(end).await;
+}
+
+/// Send one request to the agent and pass its one reply back.
+async fn relay_agent_request(agent: &mut UnixStream, request: &[u8], id: u32, out: &Out) -> io::Result<()> {
+    let gone = || io::Error::from(io::ErrorKind::BrokenPipe);
+    agent.write_all(request).await?;
+    let mut header = [0u8; 4];
+    agent.read_exact(&mut header).await?;
+    if !send_data(out, id, &header).await {
+        return Err(gone());
+    }
+    let mut left = u32::from_be_bytes(header) as usize;
+    let mut buf = vec![0u8; DATA_CHUNK.min(left)];
+    while left > 0 {
+        let want = left.min(buf.len());
+        let n = agent.read(&mut buf[..want]).await?;
+        if n == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        if !send_data(out, id, &buf[..n]).await {
+            return Err(gone());
+        }
+        left -= n;
+    }
+    Ok(())
+}
+
 /// Answer one request of the container's git credential helper with the
 /// host's `git credential fill|approve|reject`. Terminal prompts are off
 /// (they would garble the session), so credentials come from the host's
 /// helpers or its askpass program.
-async fn git_credential_channel(id: u32, mut inbox: mpsc::Receiver<ChanMsg>, out: Out, reg: Arc<Registry>) {
+async fn git_credential_channel(
+    id: u32,
+    mut inbox: mpsc::Receiver<ChanMsg>,
+    out: Out,
+    reg: Arc<Registry>,
+    ctx: &HostCtx,
+) {
     let mut req = vec![];
     let mut too_long = false;
     loop {
@@ -919,19 +1019,52 @@ async fn git_credential_channel(id: u32, mut inbox: mpsc::Receiver<ChanMsg>, out
     };
     let reply = match parsed {
         Err(e) => format!("error: {e}\n"),
-        Ok((action, attrs)) => match host_git_credential(action, &attrs).await {
-            Ok(answer) => format!("ok\n{answer}"),
-            Err(e) => format!("error: {e}\n"),
-        },
+        Ok((action, attrs)) => {
+            // One request at a time: each can raise a password dialog on
+            // the host.
+            let mut served = ctx.git.as_ref().expect("checked when the channel opened").lock().await;
+            answer_git_credential(action, &attrs, &mut served).await
+        }
     };
-    let _ = out
-        .send(Frame::Data {
-            channel: id,
-            data: reply.into_bytes(),
-        })
-        .await;
+    send_data(&out, id, reply.as_bytes()).await;
     let _ = out.send(Frame::Eof { channel: id }).await;
     reg.remove(id);
+}
+
+/// `get` asks the host's git and remembers what it answered. `store` and
+/// `erase` only select one of those remembered answers, which is what the
+/// host's git is then given: the container can't make the host store a
+/// credential of its own, or erase one it was never handed. Anything else
+/// is ignored without an error, as git calls `store` after every login
+/// that worked, whoever supplied the credential.
+async fn answer_git_credential(
+    action: crate::gitcred::Action,
+    attrs: &str,
+    served: &mut crate::gitcred::Served,
+) -> String {
+    use crate::gitcred::Action;
+    let result = match action {
+        Action::Get => host_git_credential(action, attrs).await.inspect(|answer| served.remember(answer)),
+        Action::Store | Action::Erase => match served.matching(attrs) {
+            Some(own) => {
+                if action == Action::Erase {
+                    served.forget(attrs);
+                }
+                host_git_credential(action, &own).await.map(|_| String::new())
+            }
+            None => {
+                crate::debug!(
+                    "git credential {}: not a credential this session got from the host; ignored",
+                    action.git_subcommand()
+                );
+                Ok(String::new())
+            }
+        },
+    };
+    match result {
+        Ok(answer) => format!("ok\n{answer}"),
+        Err(e) => format!("error: {e}\n"),
+    }
 }
 
 /// The host's `git credential SUB`. It runs in `/`, not in our working
@@ -1071,12 +1204,7 @@ async fn browser_channel(id: u32, mut inbox: mpsc::Receiver<ChanMsg>, out: Out, 
             },
         }
     };
-    let _ = out
-        .send(Frame::Data {
-            channel: id,
-            data: format!("{reply}\n").into_bytes(),
-        })
-        .await;
+    send_data(&out, id, format!("{reply}\n").as_bytes()).await;
     let _ = out.send(Frame::Eof { channel: id }).await;
     reg.remove(id);
 }
@@ -1123,6 +1251,9 @@ mod tests {
         let a = parse_exec_args(&s(&["--x11-relay", "--no-browser", "--no-ssh-agent"])).unwrap();
         assert!(a.dc_args.is_empty() && a.cmd.is_empty());
         assert!(a.x11 && a.force_relay && !a.browser && !a.ssh_agent && a.wayland);
+        assert!(!a.ssh_agent_unfiltered);
+        let a = parse_exec_args(&s(&["--ssh-agent-unfiltered", "--", "--ssh-agent-unfiltered"])).unwrap();
+        assert!(a.ssh_agent && a.ssh_agent_unfiltered && a.dc_args.is_empty());
 
         let a = parse_exec_args(&s(&["--no-wayland", "--", "--no-wayland"])).unwrap();
         assert!(!a.wayland && a.dc_args.is_empty());
