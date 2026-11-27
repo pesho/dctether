@@ -217,7 +217,11 @@ helper (`dctether-git-credential`, next to the container binary) sends
 git's request to the host, which answers with `git credential
 fill|approve|reject`: your host's helpers answer, or your host's askpass
 program asks you. Terminal prompts are off on the host side, so they
-can't interfere with your session.
+can't interfere with your session. The host's git runs in `/`, not in
+your workspace: the workspace is mounted into the container, so its
+`.git/config` could name a helper for the host to run. Credential
+settings in a repository's own configuration on the host are therefore
+not used.
 
 Only `http` and `https` requests and git's documented attributes are
 accepted.
