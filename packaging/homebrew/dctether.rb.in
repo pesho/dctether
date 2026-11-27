@@ -1,0 +1,39 @@
+class Dctether < Formula
+  desc "Forward SSH agent, X11 and BROWSER into devcontainer exec sessions"
+  homepage "https://github.com/pesho/dctether"
+  version "@VERSION@"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/pesho/dctether/releases/download/v@VERSION@/dctether-@VERSION@-aarch64-apple-darwin.tar.gz"
+      sha256 "@SHA_MACOS_ARM@"
+    end
+    on_intel do
+      url "https://github.com/pesho/dctether/releases/download/v@VERSION@/dctether-@VERSION@-x86_64-apple-darwin.tar.gz"
+      sha256 "@SHA_MACOS_INTEL@"
+    end
+  end
+  on_linux do
+    on_arm do
+      url "https://github.com/pesho/dctether/releases/download/v@VERSION@/dctether-@VERSION@-aarch64-unknown-linux-musl.tar.gz"
+      sha256 "@SHA_LINUX_ARM@"
+    end
+    on_intel do
+      url "https://github.com/pesho/dctether/releases/download/v@VERSION@/dctether-@VERSION@-x86_64-unknown-linux-musl.tar.gz"
+      sha256 "@SHA_LINUX_INTEL@"
+    end
+  end
+
+  depends_on "devcontainer"
+
+  def install
+    bin.install "bin/dctether"
+    # Static Linux builds copied into containers; found via <prefix>/libexec/dctether.
+    (libexec/"dctether").install Dir["libexec/dctether/*"]
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/dctether --version")
+  end
+end

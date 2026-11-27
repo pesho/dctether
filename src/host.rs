@@ -1,0 +1,753 @@
+//! Host half: `dctether exec`.
+//!
+//! 1. Start the container agent over its own `devcontainer exec`, copying
+//!    the right static binary into the container first if it is missing.
+//! 2. Handshake: learn the container's network namespace and shell, offer
+//!    forwards, receive the environment to use.
+//! 3. Run the user's command in a second `devcontainer exec` with that
+//!    environment, relaying channels until it exits.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+use std::sync::Arc;
+use std::time::Duration;
+
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
+
+use crate::browser;
+use crate::mux::{self, ChanMsg, FrameReader, Out, Registry};
+use crate::proto::{ChannelKind, Control, Frame, PROTOCOL_VERSION, X11Direct, X11Offer, X11Ready, XAuthCookie};
+use crate::x11::ClientFilter;
+use crate::xauth::{self, Display};
+
+/// Container architectures we can ship a binary for, as `uname -m` names them.
+pub const ARCHES: [&str; 2] = ["x86_64", "aarch64"];
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExecArgs {
+    /// Passed verbatim to every `devcontainer exec`.
+    pub dc_args: Vec<String>,
+    pub cmd: Vec<String>,
+    pub ssh_agent: bool,
+    pub x11: bool,
+    pub browser: bool,
+    pub force_relay: bool,
+}
+
+/// `[options and devcontainer-exec options…] [-- cmd…]`. dctether's own
+/// options are recognized anywhere before `--`; everything else there is
+/// passed to `devcontainer exec` untouched.
+pub fn parse_exec_args(args: &[String]) -> ExecArgs {
+    let (before, cmd) = match args.iter().position(|a| a == "--") {
+        Some(i) => (&args[..i], args[i + 1..].to_vec()),
+        None => (args, vec![]),
+    };
+    let mut a = ExecArgs {
+        dc_args: vec![],
+        cmd,
+        ssh_agent: true,
+        x11: true,
+        browser: true,
+        force_relay: false,
+    };
+    for arg in before {
+        match arg.as_str() {
+            "--no-ssh-agent" => a.ssh_agent = false,
+            "--no-x11" => a.x11 = false,
+            "--no-browser" => a.browser = false,
+            "--x11-relay" => a.force_relay = true,
+            _ => a.dc_args.push(arg.clone()),
+        }
+    }
+    a
+}
+
+pub fn exec_main(args: &[String]) -> i32 {
+    let a = parse_exec_args(args);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    match rt.block_on(run(a)) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("dctether: {e}");
+            1
+        }
+    }
+}
+
+async fn run(a: ExecArgs) -> Result<i32, String> {
+    let dc = std::env::var("DCTETHER_DEVCONTAINER").unwrap_or_else(|_| "devcontainer".into());
+    let bins = locate_binaries()?;
+
+    let (mut agent, mut reader, stdin) = start_agent(&dc, &a.dc_args, &bins).await?;
+    let (out, out_rx) = mpsc::channel::<Frame>(64);
+    let writer = tokio::spawn(mux::write_frames(stdin, out_rx));
+
+    // Handshake.
+    let (netns, shell) = match reader.next().await {
+        Ok(Some(Frame::Control(Control::Hello {
+            protocol,
+            version,
+            netns,
+            shell,
+        }))) => {
+            if protocol != PROTOCOL_VERSION {
+                return Err(format!(
+                    "container agent {version} speaks protocol {protocol}, expected {PROTOCOL_VERSION}"
+                ));
+            }
+            (netns, shell)
+        }
+        other => return Err(format!("container agent did not start ({})", describe(other))),
+    };
+
+    let ssh_sock = a
+        .ssh_agent
+        .then(|| std::env::var_os("SSH_AUTH_SOCK"))
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let host_x11 = if a.x11 { HostX11::from_env() } else { None };
+    let offer = host_x11.as_ref().map(|hx| X11Offer {
+        direct: if a.force_relay { None } else { hx.direct_offer(netns.as_deref()) },
+        relay: true,
+    });
+    crate::debug!(
+        "container netns {:?}; X11 {}",
+        netns,
+        match &offer {
+            None => "off".to_string(),
+            Some(o) if o.direct.is_some() => "direct offered".to_string(),
+            Some(_) => "relay only".to_string(),
+        }
+    );
+    send(
+        &out,
+        Frame::Control(Control::Setup {
+            ssh_agent: ssh_sock.is_some(),
+            browser: a.browser,
+            x11: offer,
+        }),
+    )
+    .await?;
+
+    let (env, x11_ready) = match reader.next().await {
+        Ok(Some(Frame::Control(Control::Ready { env, x11 }))) => (env, x11),
+        Ok(Some(Frame::Control(Control::Error { message }))) => return Err(message),
+        other => return Err(format!("container agent failed during setup ({})", describe(other))),
+    };
+    crate::debug!(
+        "X11 mode: {}",
+        match &x11_ready {
+            None => "off".to_string(),
+            Some(X11Ready::Direct) => "direct".to_string(),
+            Some(X11Ready::Relay { display, .. }) => format!("relay on :{display}"),
+        }
+    );
+
+    let relay = match (x11_ready, host_x11) {
+        (Some(X11Ready::Relay { fake_auth, .. }), Some(hx)) => Some(X11Relay {
+            display: hx.display,
+            fake: (fake_auth.name.into_bytes(), fake_auth.data),
+            real: hx
+                .cookie
+                .map(|c| (c.name.into_bytes(), c.data))
+                .unwrap_or_default(),
+        }),
+        _ => None,
+    };
+    let ctx = Arc::new(HostCtx {
+        ssh_sock,
+        relay,
+        browser: a.browser,
+    });
+    let reg = Arc::new(Registry::default());
+    let mut relay_task = tokio::spawn(host_read_loop(reader, reg, out.clone(), ctx));
+
+    // The user's command.
+    let cmd = if a.cmd.is_empty() {
+        vec![shell.unwrap_or_else(|| "/bin/sh".into())]
+    } else {
+        a.cmd
+    };
+    let mut user = Command::new(&dc);
+    user.arg("exec").args(&a.dc_args);
+    for (k, v) in &env {
+        user.arg("--remote-env").arg(format!("{k}={v}"));
+    }
+    user.args(&cmd);
+    let mut child = user.spawn().map_err(|e| format!("{dc}: {e}"))?;
+    forward_signals(child.id());
+
+    let status = loop {
+        tokio::select! {
+            s = child.wait() => break s.map_err(|e| e.to_string())?,
+            r = &mut relay_task, if !relay_task.is_finished() => {
+                let why = r.unwrap_or_else(|e| e.to_string());
+                eprintln!("\r\ndctether: forwarding stopped: {why}\r");
+            }
+        }
+    };
+
+    // Closing the agent's stdin ends the session in the container.
+    relay_task.abort();
+    writer.abort();
+    drop(out);
+    if tokio::time::timeout(Duration::from_secs(5), agent.wait()).await.is_err() {
+        let _ = agent.kill().await;
+    }
+    Ok(exit_code(status))
+}
+
+async fn send(out: &Out, f: Frame) -> Result<(), String> {
+    out.send(f)
+        .await
+        .map_err(|_| "container agent pipe closed".to_string())
+}
+
+fn describe(r: io::Result<Option<Frame>>) -> String {
+    match r {
+        Ok(None) => "it exited".into(),
+        Ok(Some(f)) => format!("unexpected {f:?}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn exit_code(s: ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
+}
+
+/// While the user's command runs, terminal signals reach it directly (it is
+/// in our process group); we only make sure they don't kill the relay, and
+/// pass on termination requests aimed at us.
+fn forward_signals(pid: Option<u32>) {
+    let (Ok(mut int), Ok(mut quit), Ok(mut term), Ok(mut hup)) = (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::quit()),
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+    ) else {
+        return;
+    };
+    let kill = move |sig| {
+        if let Some(pid) = pid {
+            unsafe { libc::kill(pid as i32, sig) };
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = int.recv() => {}
+                _ = quit.recv() => {}
+                _ = term.recv() => kill(libc::SIGTERM),
+                _ = hup.recv() => kill(libc::SIGHUP),
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Container binaries
+
+pub struct AgentBinary {
+    pub arch: &'static str,
+    pub bytes: Vec<u8>,
+    /// Content hash prefix; part of the cache directory name, so a changed
+    /// build is never mistaken for a cached one.
+    pub hash: String,
+}
+
+impl AgentBinary {
+    fn cache_name(&self) -> String {
+        format!("{}-{}", crate::VERSION, self.hash)
+    }
+}
+
+/// Static Linux builds for each container architecture, looked up in
+/// `$DCTETHER_AGENT_DIR`, then `<prefix>/libexec/dctether` next to this
+/// executable; a static Linux build of the same architecture also serves
+/// as its own container half.
+fn locate_binaries() -> Result<Vec<AgentBinary>, String> {
+    let exe = std::env::current_exe().and_then(|p| p.canonicalize()).ok();
+    let mut dirs = vec![];
+    if let Some(d) = std::env::var_os("DCTETHER_AGENT_DIR") {
+        dirs.push(PathBuf::from(d));
+    }
+    if let Some(prefix) = exe.as_deref().and_then(Path::parent).and_then(Path::parent) {
+        dirs.push(prefix.join("libexec/dctether"));
+    }
+    let mut out = vec![];
+    for arch in ARCHES {
+        let mut path = dirs
+            .iter()
+            .map(|d| d.join(format!("dctether-linux-{arch}")))
+            .find(|p| p.is_file());
+        if path.is_none() && cfg!(all(target_os = "linux", target_env = "musl")) && std::env::consts::ARCH == arch {
+            path = exe.clone();
+        }
+        if let Some(p) = path {
+            let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            let digest = Sha256::digest(&bytes);
+            let hash = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+            crate::debug!("container binary for {arch}: {}", p.display());
+            out.push(AgentBinary { arch, bytes, hash });
+        }
+    }
+    if out.is_empty() {
+        return Err("no static Linux build of dctether found for the container \
+             (looked in $DCTETHER_AGENT_DIR and <prefix>/libexec/dctether)"
+            .into());
+    }
+    Ok(out)
+}
+
+/// Shell snippet resolving the cache directory inside the container.
+const CACHE_DIR: &str = r#""${XDG_CACHE_HOME:-$HOME/.cache}/dctether""#;
+
+/// One `sh -c` that detects the architecture and starts the cached agent,
+/// or reports that it is missing. Saves a separate probe round trip.
+pub fn boot_script(bins: &[(&str, String)], debug: bool) -> String {
+    let mut s = format!(
+        "c={CACHE_DIR}\nm=$(uname -m)\ncase \"$m\" in arm64) m=aarch64;; esac\nb=\ncase \"$m\" in\n"
+    );
+    for (arch, name) in bins {
+        s += &format!("  {arch}) b=\"$c/{name}/dctether\";;\n");
+    }
+    s += "esac\n";
+    let flag = if debug { " --debug" } else { "" };
+    s += &format!(
+        "if [ -n \"$b\" ] && [ -x \"$b\" ]; then echo 'dctether-boot ok'; exec \"$b\" agent{flag}; fi\n\
+         echo \"dctether-boot missing $m\"\n"
+    );
+    s
+}
+
+/// Install the binary arriving on stdin. Written under a temporary name and
+/// renamed only once its size is verified, so concurrent or interrupted
+/// uploads never leave a broken `dctether` behind.
+pub fn upload_script(name: &str, size: usize) -> String {
+    format!(
+        "set -e\n\
+         d={CACHE_DIR}/{name}\n\
+         mkdir -p \"$d\"\n\
+         t=\"$d/.upload.$$\"\n\
+         trap 'rm -f \"$t\"' EXIT\n\
+         cat > \"$t\"\n\
+         [ \"$(wc -c < \"$t\" | tr -d ' ')\" = {size} ] || {{ echo 'dctether: upload was truncated' >&2; exit 1; }}\n\
+         chmod 755 \"$t\"\n\
+         ln -sf dctether \"$d/dctether-browser\"\n\
+         mv -f \"$t\" \"$d/dctether\"\n"
+    )
+}
+
+type AgentReader = FrameReader<BufReader<ChildStdout>>;
+
+async fn start_agent(
+    dc: &str,
+    dc_args: &[String],
+    bins: &[AgentBinary],
+) -> Result<(Child, AgentReader, tokio::process::ChildStdin), String> {
+    let names: Vec<_> = bins.iter().map(|b| (b.arch, b.cache_name())).collect();
+    let script = boot_script(&names, crate::debug_enabled());
+    for attempt in 0..2 {
+        let mut child = Command::new(dc)
+            .arg("exec")
+            .args(dc_args)
+            .args(["sh", "-c", &script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            // Keep terminal signals (Ctrl-C meant for the user's command)
+            // away from the relay.
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("{dc}: {e}"))?;
+        let stdin = child.stdin.take().unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let line = read_boot_line(&mut stdout)
+            .await
+            .map_err(|e| format!("reading from container: {e}"))?;
+        match line.as_deref() {
+            Some("ok") => return Ok((child, FrameReader::new(stdout), stdin)),
+            Some(l) if l.starts_with("missing ") && attempt == 0 => {
+                let arch = &l["missing ".len()..];
+                drop(stdin);
+                let _ = child.wait().await;
+                let bin = bins
+                    .iter()
+                    .find(|b| b.arch == arch)
+                    .ok_or_else(|| format!("no dctether build for container architecture {arch:?}"))?;
+                upload(dc, dc_args, bin).await?;
+            }
+            _ => {
+                let status = child.wait().await.map_err(|e| e.to_string())?;
+                return Err(format!("could not start the container agent ({status})"));
+            }
+        }
+    }
+    Err("container agent still missing after upload".into())
+}
+
+/// The first line starting with `dctether-boot `, without that prefix.
+async fn read_boot_line<R: AsyncRead + Unpin>(r: &mut BufReader<R>) -> io::Result<Option<String>> {
+    let mut limited = r.take(64 * 1024);
+    let mut line = vec![];
+    loop {
+        line.clear();
+        if limited.read_until(b'\n', &mut line).await? == 0 {
+            return Ok(None);
+        }
+        if let Some(rest) = line.strip_prefix(b"dctether-boot ") {
+            return Ok(Some(String::from_utf8_lossy(rest).trim_end().to_string()));
+        }
+    }
+}
+
+async fn upload(dc: &str, dc_args: &[String], bin: &AgentBinary) -> Result<(), String> {
+    crate::debug!("copying {} binary ({} bytes) into the container", bin.arch, bin.bytes.len());
+    let mut child = Command::new(dc)
+        .arg("exec")
+        .args(dc_args)
+        .args(["sh", "-c", &upload_script(&bin.cache_name(), bin.bytes.len())])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("{dc}: {e}"))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let w = stdin.write_all(&bin.bytes).await;
+    drop(stdin);
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    match (w, status.success()) {
+        (Ok(()), true) => Ok(()),
+        (Err(e), _) => Err(format!("copying dctether into the container: {e}")),
+        (_, false) => Err(format!("copying dctether into the container failed ({status})")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-side endpoints
+
+struct HostX11 {
+    display: Display,
+    cookie: Option<XAuthCookie>,
+}
+
+impl HostX11 {
+    fn from_env() -> Option<HostX11> {
+        let display = xauth::parse_display(&std::env::var("DISPLAY").ok()?)?;
+        let file = std::env::var_os("XAUTHORITY")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| Path::new(&h).join(".Xauthority")));
+        let entries = file.and_then(|f| std::fs::read(f).ok()).map(|b| xauth::parse(&b)).unwrap_or_default();
+        let cookie = xauth::find_cookie(&entries, &hostname(), display.number()).map(|e| XAuthCookie {
+            name: String::from_utf8_lossy(&e.name).into_owned(),
+            data: e.data.clone(),
+        });
+        crate::debug!("host DISPLAY {display:?}, cookie {}", if cookie.is_some() { "found" } else { "not found" });
+        Some(HostX11 { display, cookie })
+    }
+
+    /// The direct path needs the container to share our network namespace
+    /// (so it sees the same abstract sockets) and the X server to listen on
+    /// an abstract socket. The agent confirms with a real connection.
+    #[cfg(target_os = "linux")]
+    fn direct_offer(&self, container_netns: Option<&str>) -> Option<X11Direct> {
+        let Display::Local { number } = self.display else {
+            return None;
+        };
+        let ours = std::fs::read_link("/proc/self/ns/net").ok()?;
+        if container_netns? != ours.to_str()? {
+            return None;
+        }
+        connect_abstract_std(&format!("/tmp/.X11-unix/X{number}")).ok()?;
+        Some(X11Direct {
+            display: number,
+            auth: self.cookie.clone(),
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn direct_offer(&self, _container_netns: Option<&str>) -> Option<X11Direct> {
+        None
+    }
+}
+
+fn hostname() -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return vec![];
+    }
+    let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf[..n].to_vec()
+}
+
+#[cfg(target_os = "linux")]
+fn connect_abstract_std(name: &str) -> io::Result<std::os::unix::net::UnixStream> {
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+    std::os::unix::net::UnixStream::connect_addr(&addr)
+}
+
+trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
+
+async fn connect_x11(display: &Display) -> io::Result<Box<dyn AsyncStream>> {
+    match display {
+        Display::Local { number } => {
+            let path = format!("/tmp/.X11-unix/X{number}");
+            #[cfg(target_os = "linux")]
+            if let Ok(s) = connect_abstract_std(&path) {
+                s.set_nonblocking(true)?;
+                return Ok(Box::new(UnixStream::from_std(s)?));
+            }
+            Ok(Box::new(UnixStream::connect(path).await?))
+        }
+        Display::Path { path, .. } => Ok(Box::new(UnixStream::connect(path).await?)),
+        Display::Tcp { host, number } => {
+            let port = u16::try_from(6000 + number).map_err(|_| io::Error::other("display number too large"))?;
+            Ok(Box::new(tokio::net::TcpStream::connect((host.as_str(), port)).await?))
+        }
+    }
+}
+
+struct X11Relay {
+    display: Display,
+    fake: (Vec<u8>, Vec<u8>),
+    real: (Vec<u8>, Vec<u8>),
+}
+
+struct HostCtx {
+    ssh_sock: Option<PathBuf>,
+    relay: Option<X11Relay>,
+    browser: bool,
+}
+
+/// Handle frames from the agent until it goes away.
+async fn host_read_loop(mut reader: AgentReader, reg: Arc<Registry>, out: Out, ctx: Arc<HostCtx>) -> String {
+    loop {
+        let frame = match reader.next().await {
+            Ok(Some(f)) => f,
+            Ok(None) => return "container agent exited".into(),
+            Err(e) => return format!("container agent: {e}"),
+        };
+        match frame {
+            Frame::Open { channel, kind } => open_channel(channel, kind, &reg, &out, &ctx).await,
+            f => {
+                if !reg.dispatch(f).await {
+                    return "unexpected control frame from container agent".into();
+                }
+            }
+        }
+    }
+}
+
+async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out, ctx: &Arc<HostCtx>) {
+    let allowed = match kind {
+        ChannelKind::SshAgent => ctx.ssh_sock.is_some(),
+        ChannelKind::X11 => ctx.relay.is_some(),
+        ChannelKind::Browser => ctx.browser,
+    };
+    if reg.contains(id) {
+        crate::debug!("container reused open channel id {id}; ignoring");
+        return;
+    }
+    let inbox = match reg.insert(id) {
+        Some(inbox) if allowed => inbox,
+        _ => {
+            reg.remove(id);
+            let _ = out.send(Frame::Close { channel: id }).await;
+            return;
+        }
+    };
+    let (reg, out, ctx) = (reg.clone(), out.clone(), ctx.clone());
+    tokio::spawn(async move {
+        let fail = |e: io::Error| {
+            crate::debug!("channel {id} ({kind:?}): {e}");
+            reg.remove(id);
+            let out = out.clone();
+            async move {
+                let _ = out.send(Frame::Close { channel: id }).await;
+            }
+        };
+        match kind {
+            ChannelKind::SshAgent => match UnixStream::connect(ctx.ssh_sock.as_ref().unwrap()).await {
+                Ok(s) => mux::pump(id, s, inbox, out.clone(), reg.clone(), None).await,
+                Err(e) => fail(e).await,
+            },
+            ChannelKind::X11 => {
+                let relay = ctx.relay.as_ref().unwrap();
+                match connect_x11(&relay.display).await {
+                    Ok(s) => {
+                        let filter = ClientFilter::new(relay.fake.clone(), relay.real.clone());
+                        mux::pump(id, s, inbox, out.clone(), reg.clone(), Some(filter)).await
+                    }
+                    Err(e) => fail(e).await,
+                }
+            }
+            ChannelKind::Browser => browser_channel(id, inbox, out.clone(), reg.clone()).await,
+        }
+    });
+}
+
+/// Read one URL (until EOF), validate it, open it, and answer `ok` or
+/// `error: …`.
+async fn browser_channel(id: u32, mut inbox: mpsc::Receiver<ChanMsg>, out: Out, reg: Arc<Registry>) {
+    let mut url = vec![];
+    let mut too_long = false;
+    loop {
+        match inbox.recv().await {
+            Some(ChanMsg::Data(d)) => {
+                if url.len() + d.len() > browser::MAX_URL {
+                    too_long = true;
+                } else {
+                    url.extend_from_slice(&d);
+                }
+            }
+            Some(ChanMsg::Eof) => break,
+            None => return,
+        }
+    }
+    let reply = if too_long {
+        "error: URL too long".to_string()
+    } else {
+        match String::from_utf8(url) {
+            Err(_) => "error: URL is not valid UTF-8".to_string(),
+            Ok(u) => match browser::validate_url(&u) {
+                Err(e) => format!("error: {e}"),
+                Ok(()) => match open_url(&u) {
+                    Ok(()) => "ok".to_string(),
+                    Err(e) => format!("error: {}: {e}", browser::opener()),
+                },
+            },
+        }
+    };
+    let _ = out
+        .send(Frame::Data {
+            channel: id,
+            data: format!("{reply}\n").into_bytes(),
+        })
+        .await;
+    let _ = out.send(Frame::Eof { channel: id }).await;
+    reg.remove(id);
+}
+
+/// Hand a validated URL to the desktop's opener as a single argument (no
+/// shell involved).
+fn open_url(url: &str) -> io::Result<()> {
+    let mut child = Command::new(browser::opener())
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_exec_args() {
+        let a = parse_exec_args(&s(&[
+            "--workspace-folder",
+            "/w",
+            "--no-x11",
+            "--remote-env",
+            "A=B",
+            "--",
+            "git",
+            "--no-x11",
+        ]));
+        assert_eq!(a.dc_args, s(&["--workspace-folder", "/w", "--remote-env", "A=B"]));
+        assert_eq!(a.cmd, s(&["git", "--no-x11"]));
+        assert!(!a.x11 && a.ssh_agent && a.browser && !a.force_relay);
+
+        let a = parse_exec_args(&s(&["--x11-relay", "--no-browser", "--no-ssh-agent"]));
+        assert!(a.dc_args.is_empty() && a.cmd.is_empty());
+        assert!(a.x11 && a.force_relay && !a.browser && !a.ssh_agent);
+    }
+
+    #[test]
+    fn boot_script_lists_known_arches() {
+        let s = boot_script(&[("x86_64", "0.1.0-abcd".into())], false);
+        assert!(s.contains("x86_64) b=\"$c/0.1.0-abcd/dctether\";;"));
+        assert!(!s.contains("aarch64)"));
+        assert!(s.contains("exec \"$b\" agent; fi"));
+        assert!(boot_script(&[], true).contains("agent --debug"));
+    }
+
+    /// Run the generated scripts with a real `sh` against a scratch HOME.
+    #[test]
+    fn boot_and_upload_scripts_work_in_sh() {
+        use std::process::{Command, Stdio};
+        let home = std::env::temp_dir().join(format!("dctether-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let arch = std::process::Command::new("uname").arg("-m").output().unwrap();
+        let arch = String::from_utf8(arch.stdout).unwrap().trim().to_string();
+        let name = "0.0.0-test".to_string();
+        let sh = |script: &str, input: &[u8]| {
+            let mut c = Command::new("sh")
+                .args(["-c", script])
+                .env("HOME", &home)
+                .env_remove("XDG_CACHE_HOME")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            c.stdin.take().unwrap().write_all(input).unwrap();
+            c.wait_with_output().unwrap()
+        };
+        let boot = boot_script(&[(arch.as_str(), name.clone())], false);
+        let o = sh(&boot, b"");
+        assert_eq!(String::from_utf8_lossy(&o.stdout), format!("dctether-boot missing {arch}\n"));
+
+        // A fake "binary" that answers like the agent would.
+        let fake = b"#!/bin/sh\necho \"agent $1\"\n";
+        let o = sh(&upload_script(&name, fake.len() + 1), fake);
+        assert!(!o.status.success(), "size mismatch must fail");
+        assert!(!home.join(".cache/dctether").join(&name).join("dctether").exists());
+
+        let o = sh(&upload_script(&name, fake.len()), fake);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let dir = home.join(".cache/dctether").join(&name);
+        assert_eq!(std::fs::read_link(dir.join("dctether-browser")).unwrap(), Path::new("dctether"));
+
+        let o = sh(&boot, b"");
+        assert_eq!(String::from_utf8_lossy(&o.stdout), "dctether-boot ok\nagent agent\n");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn boot_line_skips_noise() {
+        let input: &[u8] = b"motd\nmore\ndctether-boot missing aarch64\n\x01rest";
+        let mut r = BufReader::new(input);
+        assert_eq!(read_boot_line(&mut r).await.unwrap().as_deref(), Some("missing aarch64"));
+        let mut rest = vec![];
+        r.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"\x01rest");
+        let mut r = BufReader::new(&b"nothing here\n"[..]);
+        assert_eq!(read_boot_line(&mut r).await.unwrap(), None);
+    }
+}
