@@ -201,6 +201,19 @@ Caveats, and why it can be turned off (`--no-wayland` on `up` or `exec`):
 - **Same user ID.** Compositor sockets are usually accessible only to
   their owner, so the container user needs your host user ID (or root).
 
+### Clipboard
+
+There is no separate clipboard forward: programs in the container reach
+your clipboard through their display connection, X11 or Wayland. Tested
+in a host-network dev container on KDE Plasma (Wayland): text copied with
+`xclip -selection clipboard` (X11) and with `wl-copy` (Wayland) shows up
+in the host clipboard, and host clipboard contents paste into apps in the
+container.
+
+Copies from Playwright's Chromium paste fine but don't appear in Klipper's
+history. Chromium marks them as secret (`x-kde-passwordManagerHint:
+secret`), the KDE convention for passwords, and Klipper honours that.
+
 ### Ports: one forwarder per container
 
 `dctether exec` forwards the `forwardPorts` of the dev container
@@ -324,8 +337,6 @@ be resolved through mDNS or other NSS-only resolvers. `:0`, `unix:0` and
 ## Not supported (yet)
 
 - Git HTTPS credential helper, gpg agent.
-- Clipboard tools in the container (`xclip`, `wl-copy`) should work
-  through the X11 and Wayland forwards, but that hasn't been tested.
 - Automatic port detection (as VS Code does), and ports of other Compose
   services (`"db:5432"`).
 - Forwards end with the `dctether exec` session. Background programs that
