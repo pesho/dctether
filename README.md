@@ -206,6 +206,15 @@ needed.
 - **Container:** Linux on x86_64 or aarch64. Tested with an Ubuntu dev
   container, and with Alpine under qemu-aarch64.
 
+Linux release builds target `*-unknown-linux-musl` and are statically
+linked. They need no C library from the system, so they run on glibc
+distributions (Fedora, Ubuntu, Debian, …) as well as on musl ones
+(Alpine), whatever their glibc version. That is also why the same binary
+can be copied into any container. One consequence: musl doesn't use
+glibc's NSS. A TCP `DISPLAY` such as `somehost.local:0` therefore can't
+be resolved through mDNS or other NSS-only resolvers. `:0`, `unix:0` and
+`localhost:N` aren't affected.
+
 ## Not supported (yet)
 
 - Wayland, git HTTPS credential helper, port forwarding, gpg agent,
