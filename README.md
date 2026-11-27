@@ -19,6 +19,30 @@ You don't need VS Code. Nothing is written to `devcontainer.json`, the
 image or shell rc files. The environment is set only on dctether's own
 `devcontainer exec`.
 
+## Install
+
+```sh
+brew install pesho/tap/dctether
+```
+
+This also installs the `devcontainer` CLI from Homebrew. Release builds
+are static, so a Linux host build doubles as the container binary for its
+own architecture. The package adds the container build for the other
+Linux architecture (both, on macOS) in `libexec/dctether/`.
+
+### From source
+
+```sh
+cargo build --release                        # host binary (target/release/dctether)
+scripts/build-container-binaries.sh          # static musl builds, in Docker
+DCTETHER_AGENT_DIR=$PWD/target/agent target/release/dctether exec ...
+```
+
+`build-container-binaries.sh` builds the `x86_64` and `aarch64`
+`*-unknown-linux-musl` binaries inside the official Rust image with
+`rust-lld`. All dependencies are pure Rust, so no cross C toolchain is
+needed.
+
 ## Usage
 
 ```sh
@@ -281,30 +305,6 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`).
   share the host's namespace and be offered the direct path, cookie
   included.
 
-## Install
-
-```sh
-brew install pesho/tap/dctether
-```
-
-This also installs the `devcontainer` CLI from Homebrew. Release builds
-are static, so a Linux host build doubles as the container binary for its
-own architecture. The package adds the container build for the other
-Linux architecture (both, on macOS) in `libexec/dctether/`.
-
-### From source
-
-```sh
-cargo build --release                        # host binary (target/release/dctether)
-scripts/build-container-binaries.sh          # static musl builds, in Docker
-DCTETHER_AGENT_DIR=$PWD/target/agent target/release/dctether exec ...
-```
-
-`build-container-binaries.sh` builds the `x86_64` and `aarch64`
-`*-unknown-linux-musl` binaries inside the official Rust image with
-`rust-lld`. All dependencies are pure Rust, so no cross C toolchain is
-needed.
-
 ## Platforms
 
 - **Host:** Linux. The code also builds for macOS (XQuartz-style `DISPLAY`
@@ -334,6 +334,21 @@ be resolved through mDNS or other NSS-only resolvers. `:0`, `unix:0` and
   reading from the pipe pauses. An X client that stops reading its socket
   can therefore stall the session's other forwards until it reads again or
   disconnects.
+
+## Changelog and releases
+
+Changes are listed in [CHANGELOG.md](CHANGELOG.md), in
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. To
+release version `X.Y.Z`:
+
+1. In `CHANGELOG.md`, rename `## [Unreleased]` to `## [X.Y.Z] - DATE`,
+   add a new empty `## [Unreleased]` above it, and update the links at
+   the bottom.
+2. Set `version = "X.Y.Z"` in `Cargo.toml` and commit.
+3. Tag `vX.Y.Z` and push the tag. The release workflow builds the
+   packages, publishes the GitHub release with that changelog section as
+   its notes, and updates the Homebrew tap. It refuses to release when the
+   tag, `Cargo.toml` and the changelog disagree.
 
 ## License
 

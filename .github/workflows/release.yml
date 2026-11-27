@@ -59,14 +59,15 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with: { path: build, merge-multiple: true }
-      - name: Check tag matches Cargo.toml
+      - name: Check tag matches Cargo.toml and the changelog
         run: |
           v="${GITHUB_REF_NAME#v}"
           grep -q "^version = \"$v\"$" Cargo.toml || { echo "tag $GITHUB_REF_NAME != Cargo.toml version"; exit 1; }
+          scripts/changelog-section.sh "$v" > release-notes.md
           echo "VERSION=$v" >> "$GITHUB_ENV"
       - run: chmod +x build/*/dctether && scripts/package.sh "$VERSION" build dist
       - env: { GH_TOKEN: "${{ github.token }}" }
-        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes dist/*.tar.gz dist/SHA256SUMS
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md dist/*.tar.gz dist/SHA256SUMS
       - name: Update Homebrew tap
         if: env.TAP_TOKEN != ''
         run: |
