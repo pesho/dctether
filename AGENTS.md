@@ -8,7 +8,7 @@ sections before changing behavior.
 
 A Rust CLI wrapping `devcontainer exec` (the `@devcontainers/cli`) that
 gives the shell what a VS Code Dev Containers terminal gets: SSH agent,
-X11, `BROWSER`, Wayland and port forwarding. One binary has two halves:
+X11, `BROWSER`, Wayland, port forwarding, git HTTPS credentials and gpg. One binary has two halves:
 the host side (`exec`, `up`, `forward`) and the container side (`agent`,
 `dctether-browser`), talking over a framed multiplex protocol on the
 agent's `devcontainer exec` stdin/stdout.
@@ -27,6 +27,7 @@ agent's `devcontainer exec` stdin/stdout.
 | `src/xauth.rs` | Xauthority format and `DISPLAY` parsing (pure) |
 | `src/wayland.rs` | Wayland socket paths and mount argument (pure) |
 | `src/browser.rs` | URL validation (host) and the `BROWSER` helper (container) |
+| `src/gitcred.rs` | Git credential request validation (pure) and the helper (container) |
 | `scripts/` | Static builds, packaging, formula rendering, changelog extraction |
 | `.github/workflows/release.yml` | Tag-triggered release and Homebrew tap update |
 | `packaging/homebrew/dctether.rb.in` | Formula template rendered at release time |

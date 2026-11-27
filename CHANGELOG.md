@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Git HTTPS credentials: git in the container asks your host's git
+  (`git credential fill|approve|reject`) through a credential helper that
+  dctether adds with git's environment-only configuration, after any
+  helpers configured in the container. Only `http` and `https` requests
+  are accepted. `--no-git-credentials` turns it off.
+- gpg: `GNUPGHOME` points to a private per-session directory with the
+  public parts of your host's secret keys and a socket relayed to your host
+  gpg-agent's restricted extra socket, so signing (for example git commit
+  signing) uses your host keys. The container's `~/.gnupg` isn't touched.
+  `--no-gpg` turns it off.
+
 ## [0.3.0] - 2026-11-27
 
 ### Added

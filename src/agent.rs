@@ -20,8 +20,8 @@ use tokio::sync::mpsc;
 
 use crate::mux::{self, FrameReader, Out, Registry};
 use crate::proto::{
-    ChannelKind, Control, Frame, HOST_CHANNEL_BIT, PROTOCOL_VERSION, WaylandStatus, X11Direct, X11Offer, X11Ready,
-    XAuthCookie,
+    ChannelKind, Control, Frame, HOST_CHANNEL_BIT, PROTOCOL_VERSION, Setup, WaylandStatus, X11Direct, X11Offer,
+    X11Ready, XAuthCookie,
 };
 use crate::xauth;
 
@@ -51,12 +51,7 @@ pub async fn main() -> i32 {
     let _ = out.send(Frame::Control(hello)).await;
 
     let setup = match reader.next().await {
-        Ok(Some(Frame::Control(Control::Setup {
-            ssh_agent,
-            browser,
-            x11,
-            wayland,
-        }))) => (ssh_agent, browser, x11, wayland),
+        Ok(Some(Frame::Control(Control::Setup(setup)))) => setup,
         Ok(None) => return 0,
         other => {
             eprintln!("dctether agent: expected setup, got {other:?}");
@@ -64,7 +59,7 @@ pub async fn main() -> i32 {
         }
     };
 
-    let mut session = match Session::create(setup.0, setup.1, setup.2, setup.3).await {
+    let mut session = match Session::create(setup).await {
         Ok(s) => s,
         Err(e) => {
             let _ = out
@@ -221,7 +216,15 @@ impl Drop for Session {
 }
 
 impl Session {
-    async fn create(ssh_agent: bool, browser: bool, x11: Option<X11Offer>, wayland: bool) -> io::Result<Session> {
+    async fn create(setup: Setup) -> io::Result<Session> {
+        let Setup {
+            ssh_agent,
+            browser,
+            x11,
+            wayland,
+            git_credentials,
+            gpg,
+        } = setup;
         let dir = std::env::temp_dir().join(format!("dctether-{}", hex(&random_bytes(8)?)));
         std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let mut s = Session {
@@ -244,16 +247,44 @@ impl Session {
             s.set_env("SSH_AUTH_SOCK", &p);
         }
 
+        // Helpers run as separate processes and find the session through
+        // DCTETHER_SESSION.
+        let mut helpers = false;
+        let exe = std::env::current_exe()?;
+
         if browser {
-            let helper = std::env::current_exe()?.with_file_name("dctether-browser");
+            let helper = exe.with_file_name("dctether-browser");
             if helper.exists() {
                 listen(&mut s, "browser.sock", ChannelKind::Browser)?;
                 s.set_env("BROWSER", &helper);
-                let dir = s.dir.clone();
-                s.set_env("DCTETHER_SESSION", &dir);
+                helpers = true;
             } else {
                 eprintln!("dctether agent: {} is missing; not setting BROWSER", helper.display());
             }
+        }
+
+        if git_credentials {
+            let helper = exe.with_file_name("dctether-git-credential");
+            if helper.exists() {
+                listen(&mut s, "git-credential.sock", ChannelKind::GitCredential)?;
+                // Git's environment-only configuration: adds the helper after
+                // any configured in files, without touching them.
+                s.env.push(("GIT_CONFIG_COUNT".into(), "1".into()));
+                s.env.push(("GIT_CONFIG_KEY_0".into(), "credential.helper".into()));
+                s.set_env("GIT_CONFIG_VALUE_0", &helper);
+                helpers = true;
+            } else {
+                eprintln!("dctether agent: {} is missing; not forwarding git credentials", helper.display());
+            }
+        }
+
+        if helpers {
+            let dir = s.dir.clone();
+            s.set_env("DCTETHER_SESSION", &dir);
+        }
+
+        if let Some(offer) = gpg {
+            s.setup_gpg(offer)?;
         }
 
         if let Some(offer) = x11 {
@@ -269,6 +300,46 @@ impl Session {
             s.wayland = Some(status);
         }
         Ok(s)
+    }
+
+    /// A private GNUPGHOME with the host's public keys and an `S.gpg-agent`
+    /// relayed to the host's gpg-agent. Skipped (not an error) when the
+    /// container has no gpg, or gpg would look for its agent elsewhere.
+    fn setup_gpg(&mut self, offer: crate::proto::GpgOffer) -> io::Result<()> {
+        let home = self.dir.join("gnupg");
+        std::fs::DirBuilder::new().mode(0o700).create(&home)?;
+        // A legacy keyring file is a plain sequence of OpenPGP packets,
+        // which is what `gpg --export` produces.
+        write_private(&home.join("pubring.gpg"), &offer.public_keys)?;
+        // Our own common.conf, so gpg doesn't create one that switches the
+        // keyring to keyboxd.
+        write_private(
+            &home.join("common.conf"),
+            b"# dctether session: keys in pubring.gpg, gpg-agent relayed to the host\n",
+        )?;
+        let socket = home.join("S.gpg-agent");
+        let expected = std::process::Command::new("gpgconf")
+            .args(["--list-dirs", "agent-socket"])
+            .env("GNUPGHOME", &home)
+            .stderr(std::process::Stdio::null())
+            .output();
+        match expected {
+            Ok(o) if o.status.success() => {
+                let said = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if Path::new(&said) != socket {
+                    eprintln!("dctether agent: gpg would look for its agent at {said}; not forwarding gpg");
+                    return Ok(());
+                }
+            }
+            _ => {
+                crate::debug!("no gpgconf in the container; not forwarding gpg");
+                return Ok(());
+            }
+        }
+        let l = UnixListener::bind(&socket)?;
+        self.listeners.push((l, ChannelKind::GpgAgent));
+        self.set_env("GNUPGHOME", &home);
+        Ok(())
     }
 
     fn set_env(&mut self, k: &str, v: &Path) {

@@ -4,6 +4,7 @@
 
 mod browser;
 mod forward;
+mod gitcred;
 mod host;
 mod mux;
 mod proto;
@@ -56,6 +57,8 @@ exec options:
   --no-browser     don't set BROWSER
   --no-wayland     don't set WAYLAND_DISPLAY
   --x11-relay      always relay X11, even if the host display is reachable directly
+  --no-git-credentials  don't answer git's HTTPS credential requests from the host
+  --no-gpg         don't relay gpg-agent (and don't set GNUPGHOME)
   -p PORT          also forward host 127.0.0.1:PORT to the container's PORT
                    (forwardPorts from the configuration are forwarded by default)
   --no-forward     don't forward any ports
@@ -81,6 +84,8 @@ fn main() {
 
     let code = if argv0 == "dctether-browser" {
         browser_helper(&args[1..])
+    } else if argv0 == "dctether-git-credential" {
+        git_credential_helper(&args[1..])
     } else {
         match args.get(1).map(String::as_str) {
             Some("exec") => host::exec_main(&args[2..]),
@@ -89,6 +94,7 @@ fn main() {
             Some("forward") => forward::forwarder_main(&args[2..]),
             Some("agent") => agent_main(&args[2..]),
             Some("browser") => browser_helper(&args[2..]),
+            Some("git-credential") => git_credential_helper(&args[2..]),
             Some("--version" | "-V") => {
                 println!("dctether {VERSION}");
                 0
@@ -132,5 +138,16 @@ fn browser_helper(args: &[String]) -> i32 {
 #[cfg(not(target_os = "linux"))]
 fn browser_helper(_: &[String]) -> i32 {
     eprintln!("dctether-browser runs inside Linux containers only");
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn git_credential_helper(args: &[String]) -> i32 {
+    gitcred::helper_main(args)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn git_credential_helper(_: &[String]) -> i32 {
+    eprintln!("dctether-git-credential runs inside Linux containers only");
     2
 }

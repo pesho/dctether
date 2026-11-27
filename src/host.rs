@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 use crate::browser;
 use crate::mux::{self, ChanMsg, FrameReader, Out, Registry};
 use crate::proto::{
-    ChannelKind, Control, Frame, HOST_CHANNEL_BIT, PROTOCOL_VERSION, WaylandStatus, X11Direct, X11Offer, X11Ready,
-    XAuthCookie,
+    ChannelKind, Control, Frame, GpgOffer, HOST_CHANNEL_BIT, PROTOCOL_VERSION, Setup, WaylandStatus, X11Direct,
+    X11Offer, X11Ready, XAuthCookie,
 };
 use crate::x11::ClientFilter;
 use crate::xauth::{self, Display};
@@ -44,6 +44,8 @@ pub struct ExecArgs {
     pub force_relay: bool,
     /// Forward `forwardPorts` and `ports`.
     pub forward: bool,
+    pub git_credentials: bool,
+    pub gpg: bool,
     /// From `-p PORT`.
     pub ports: Vec<u16>,
 }
@@ -66,6 +68,8 @@ pub fn parse_exec_args(args: &[String]) -> Result<ExecArgs, String> {
         force_relay: false,
         forward: true,
         ports: vec![],
+        git_credentials: true,
+        gpg: true,
     };
     let mut it = before.iter();
     while let Some(arg) = it.next() {
@@ -75,6 +79,8 @@ pub fn parse_exec_args(args: &[String]) -> Result<ExecArgs, String> {
             "--no-browser" => a.browser = false,
             "--no-wayland" => a.wayland = false,
             "--no-forward" => a.forward = false,
+            "--no-git-credentials" => a.git_credentials = false,
+            "--no-gpg" => a.gpg = false,
             "--x11-relay" => a.force_relay = true,
             "-p" => {
                 let v = it.next().ok_or("-p needs a port number")?;
@@ -128,6 +134,9 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
         })
     });
 
+    // The host's gpg-agent and public keys, also while the agent starts.
+    let gpg = a.gpg.then(|| tokio::task::spawn_blocking(host_gpg));
+
     let (mut agent, mut reader, stdin) = start_agent(&dc, &a.dc_args, &bins).await?;
     let (out, out_rx) = mpsc::channel::<Frame>(64);
     let writer = tokio::spawn(mux::write_frames(stdin, out_rx));
@@ -171,15 +180,24 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
             Some(_) => "relay only".to_string(),
         }
     );
+    let gpg = match gpg {
+        Some(task) => task.await.unwrap_or(None),
+        None => None,
+    };
+    let git_credentials = a.git_credentials && which("git");
     send(
         &out,
-        Frame::Control(Control::Setup {
+        Frame::Control(Control::Setup(Setup {
             ssh_agent: ssh_sock.is_some(),
             browser: a.browser,
             x11: offer,
             // Only meaningful when this host has a Wayland session to share.
             wayland: a.wayland && host_wayland_socket().is_some(),
-        }),
+            git_credentials,
+            gpg: gpg.as_ref().map(|g| GpgOffer {
+                public_keys: g.public_keys.clone(),
+            }),
+        })),
     )
     .await?;
 
@@ -218,6 +236,8 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
         ssh_sock,
         relay,
         browser: a.browser,
+        git_credentials,
+        gpg_socket: gpg.map(|g| g.extra_socket),
     });
     let reg = Arc::new(Registry::default());
     let mut relay_task = tokio::spawn(host_read_loop(reader, reg, out.clone(), ctx));
@@ -270,13 +290,17 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
 /// Variables the agent may set, and what their values may look like. The
 /// agent runs in the (untrusted) container and these end up on the host's
 /// `devcontainer` command line.
-const FORWARDED_ENV: [&str; 6] = [
+const FORWARDED_ENV: [&str; 10] = [
     "SSH_AUTH_SOCK",
     "DISPLAY",
     "XAUTHORITY",
     "BROWSER",
     "DCTETHER_SESSION",
     "WAYLAND_DISPLAY",
+    "GNUPGHOME",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
 ];
 
 pub fn check_env(env: &[(String, String)]) -> Result<(), String> {
@@ -284,11 +308,14 @@ pub fn check_env(env: &[(String, String)]) -> Result<(), String> {
         if !FORWARDED_ENV.contains(&k.as_str()) {
             return Err(format!("container agent asked to set unexpected variable {k:?}"));
         }
-        let ok = if k == "DISPLAY" {
-            v.strip_prefix(':')
-                .is_some_and(|n| (1..=5).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit()))
-        } else {
-            is_safe_path(v)
+        let ok = match k.as_str() {
+            "DISPLAY" => v
+                .strip_prefix(':')
+                .is_some_and(|n| (1..=5).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit())),
+            // Exactly the one git setting dctether adds.
+            "GIT_CONFIG_COUNT" => v == "1",
+            "GIT_CONFIG_KEY_0" => v == "credential.helper",
+            _ => is_safe_path(v),
         };
         if !ok {
             return Err(format!("container agent sent an invalid value for {k}: {v:?}"));
@@ -577,6 +604,7 @@ pub fn upload_script(name: &str, size: usize) -> String {
          [ \"$(wc -c < \"$t\" | tr -d ' ')\" = {size} ] || {{ echo 'dctether: upload was truncated' >&2; exit 1; }}\n\
          chmod 755 \"$t\"\n\
          ln -sf dctether \"$d/dctether-browser\"\n\
+         ln -sf dctether \"$d/dctether-git-credential\"\n\
          mv -f \"$t\" \"$d/dctether\"\n"
     )
 }
@@ -764,6 +792,9 @@ pub(crate) struct HostCtx {
     ssh_sock: Option<PathBuf>,
     relay: Option<X11Relay>,
     browser: bool,
+    git_credentials: bool,
+    /// The host gpg-agent's extra socket.
+    gpg_socket: Option<PathBuf>,
 }
 
 impl HostCtx {
@@ -774,6 +805,8 @@ impl HostCtx {
             ssh_sock: None,
             relay: None,
             browser: false,
+            git_credentials: false,
+            gpg_socket: None,
         }
     }
 }
@@ -805,6 +838,8 @@ async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out
             ChannelKind::SshAgent => ctx.ssh_sock.is_some(),
             ChannelKind::X11 => ctx.relay.is_some(),
             ChannelKind::Browser => ctx.browser,
+            ChannelKind::GitCredential => ctx.git_credentials,
+            ChannelKind::GpgAgent => ctx.gpg_socket.is_some(),
             ChannelKind::Tcp(_) => false,
         };
     if reg.contains(id) {
@@ -845,9 +880,152 @@ async fn open_channel(id: u32, kind: ChannelKind, reg: &Arc<Registry>, out: &Out
                 }
             }
             ChannelKind::Browser => browser_channel(id, inbox, out.clone(), reg.clone()).await,
+            ChannelKind::GitCredential => git_credential_channel(id, inbox, out.clone(), reg.clone()).await,
+            ChannelKind::GpgAgent => match UnixStream::connect(ctx.gpg_socket.as_ref().unwrap()).await {
+                Ok(s) => mux::pump(id, s, inbox, out.clone(), reg.clone(), None).await,
+                Err(e) => fail(e).await,
+            },
             ChannelKind::Tcp(_) => unreachable!("refused above"),
         }
     });
+}
+
+/// Answer one request of the container's git credential helper with the
+/// host's `git credential fill|approve|reject`. Terminal prompts are off
+/// (they would garble the session), so credentials come from the host's
+/// helpers or its askpass program.
+async fn git_credential_channel(id: u32, mut inbox: mpsc::Receiver<ChanMsg>, out: Out, reg: Arc<Registry>) {
+    let mut req = vec![];
+    let mut too_long = false;
+    loop {
+        match inbox.recv().await {
+            Some(ChanMsg::Data(d)) => {
+                if req.len() + d.len() > crate::gitcred::MAX_REQUEST {
+                    too_long = true;
+                } else {
+                    req.extend_from_slice(&d);
+                }
+            }
+            Some(ChanMsg::Eof) => break,
+            None => return,
+        }
+    }
+    let parsed = if too_long {
+        Err("request too large".to_string())
+    } else {
+        String::from_utf8(req)
+            .map_err(|_| "request is not valid UTF-8".to_string())
+            .and_then(|r| crate::gitcred::parse_request(&r))
+    };
+    let reply = match parsed {
+        Err(e) => format!("error: {e}\n"),
+        Ok((action, attrs)) => match host_git_credential(action, &attrs).await {
+            Ok(answer) => format!("ok\n{answer}"),
+            Err(e) => format!("error: {e}\n"),
+        },
+    };
+    let _ = out
+        .send(Frame::Data {
+            channel: id,
+            data: reply.into_bytes(),
+        })
+        .await;
+    let _ = out.send(Frame::Eof { channel: id }).await;
+    reg.remove(id);
+}
+
+async fn host_git_credential(action: crate::gitcred::Action, attrs: &str) -> Result<String, String> {
+    let sub = action.git_subcommand();
+    let mut child = Command::new("git")
+        .args(["credential", sub])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = stdin.write_all(attrs.as_bytes()).await;
+    drop(stdin);
+    // Long enough for a password dialog on the host.
+    let o = tokio::time::timeout(Duration::from_secs(300), child.wait_with_output())
+        .await
+        .map_err(|_| format!("git credential {sub} timed out"))?
+        .map_err(|e| e.to_string())?;
+    if !o.status.success() {
+        return Err(format!("git credential {sub} found no credential"));
+    }
+    Ok(String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// What gpg forwarding needs from the host.
+struct HostGpg {
+    extra_socket: PathBuf,
+    public_keys: Vec<u8>,
+}
+
+/// The host gpg-agent's extra socket (the one meant for remote use, with
+/// restricted commands) and the public parts of the host's secret keys.
+/// `None` when gpg isn't installed or there are no secret keys.
+fn host_gpg() -> Option<HostGpg> {
+    let run = |cmd: &str, args: &[&str]| -> Option<Vec<u8>> {
+        let o = std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        o.status.success().then_some(o.stdout)
+    };
+    let socket = run("gpgconf", &["--list-dirs", "agent-extra-socket"])?;
+    let extra_socket = PathBuf::from(String::from_utf8_lossy(&socket).trim());
+    // Starts the agent if it isn't running, so the socket exists.
+    run("gpgconf", &["--launch", "gpg-agent"])?;
+    let listing = run("gpg", &["--batch", "--with-colons", "--list-secret-keys"])?;
+    let fprs = secret_key_fingerprints(&String::from_utf8_lossy(&listing));
+    if fprs.is_empty() {
+        crate::debug!("no gpg secret keys on the host; not forwarding gpg");
+        return None;
+    }
+    let mut args = vec!["--batch", "--export"];
+    args.extend(fprs.iter().map(String::as_str));
+    let public_keys = run("gpg", &args)?;
+    if public_keys.is_empty() || public_keys.len() > 256 * 1024 {
+        crate::debug!("unexpected gpg export size {}; not forwarding gpg", public_keys.len());
+        return None;
+    }
+    crate::debug!("gpg: {} secret key(s), agent at {}", fprs.len(), extra_socket.display());
+    Some(HostGpg {
+        extra_socket,
+        public_keys,
+    })
+}
+
+/// Fingerprints of the primary keys in `gpg --with-colons --list-secret-keys`
+/// output: the first `fpr` record after each `sec` record.
+pub fn secret_key_fingerprints(colons: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut want = false;
+    for line in colons.lines() {
+        let f: Vec<&str> = line.split(':').collect();
+        match f.first() {
+            Some(&"sec") => want = true,
+            Some(&"fpr") if want => {
+                if let Some(fpr) = f.get(9).filter(|x| !x.is_empty() && x.bytes().all(|b| b.is_ascii_hexdigit())) {
+                    out.push(fpr.to_string());
+                }
+                want = false;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn which(cmd: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
 }
 
 /// Read one URL (until EOF), validate it, open it, and answer `ok` or
@@ -944,6 +1122,8 @@ mod tests {
         assert_eq!(a.dc_args, s(&["--workspace-folder", "/w"]));
         assert!(a.forward);
         assert!(!parse_exec_args(&s(&["--no-forward"])).unwrap().forward);
+        let a = parse_exec_args(&s(&["--no-gpg", "--no-git-credentials"])).unwrap();
+        assert!(!a.gpg && !a.git_credentials && a.dc_args.is_empty());
         assert!(parse_exec_args(&s(&["-p"])).is_err());
         assert!(parse_exec_args(&s(&["-p", "0"])).is_err());
         assert!(parse_exec_args(&s(&["-p", "http"])).is_err());
@@ -959,6 +1139,13 @@ mod tests {
         assert!(ok("BROWSER", "/home/u/.cache/dctether/0.1.0-ab/dctether-browser"));
         assert!(ok("DCTETHER_SESSION", "/tmp/d"));
         assert!(ok("WAYLAND_DISPLAY", "/tmp/dctether-wayland.sock"));
+        assert!(ok("GNUPGHOME", "/tmp/dctether-0123/gnupg"));
+        assert!(ok("GIT_CONFIG_COUNT", "1"));
+        assert!(ok("GIT_CONFIG_KEY_0", "credential.helper"));
+        assert!(ok("GIT_CONFIG_VALUE_0", "/home/u/.cache/dctether/v/dctether-git-credential"));
+        assert!(!ok("GIT_CONFIG_COUNT", "2"));
+        assert!(!ok("GIT_CONFIG_KEY_0", "core.sshCommand"));
+        assert!(!ok("GIT_CONFIG_VALUE_0", "!sh -c id"));
         assert!(!ok("WAYLAND_DISPLAY", "wayland-0"));
         assert!(!ok("LD_PRELOAD", "/tmp/x.so"));
         assert!(!ok("--docker-path", "/x"));
@@ -970,6 +1157,27 @@ mod tests {
         assert!(!ok("DISPLAY", ":0.0"));
         assert!(!ok("DISPLAY", "--x"));
         assert!(is_safe_path("/bin/bash") && !is_safe_path("--docker-path=/x") && !is_safe_path("bash"));
+    }
+
+    #[test]
+    fn finds_secret_key_fingerprints() {
+        let listing = "sec:u:255:22:AAAA:1700000000::::::scESC:::+:::ed25519:::0:\n\
+                       fpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:\n\
+                       grp:::::::::1111111111111111111111111111111111111111:\n\
+                       uid:u::::1700000000::HASH::Me <me@example.com>::::::::::0:\n\
+                       ssb:u:255:18:BBBB:1700000000::::::e:::+:::cv25519::\n\
+                       fpr:::::::::FEDCBA9876543210FEDCBA9876543210FEDCBA98:\n\
+                       sec:e:3072:1:CCCC:1500000000:1600000000:::::sc:::+:::::0:\n\
+                       fpr:::::::::AAAABBBBCCCCDDDDEEEEFFFF0000111122223333:\n";
+        assert_eq!(
+            secret_key_fingerprints(listing),
+            vec![
+                "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+                "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333".to_string(),
+            ]
+        );
+        assert!(secret_key_fingerprints("").is_empty());
+        assert!(secret_key_fingerprints("sec:u:::\nfpr:::::::::--batch:\n").is_empty());
     }
 
     #[test]
@@ -1020,6 +1228,7 @@ mod tests {
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         let dir = home.join(".cache/dctether").join(&name);
         assert_eq!(std::fs::read_link(dir.join("dctether-browser")).unwrap(), Path::new("dctether"));
+        assert_eq!(std::fs::read_link(dir.join("dctether-git-credential")).unwrap(), Path::new("dctether"));
 
         let o = sh(&boot, b"");
         assert_eq!(String::from_utf8_lossy(&o.stdout), "dctether-boot ok\nagent agent\n");

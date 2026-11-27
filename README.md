@@ -14,6 +14,10 @@ what a VS Code Dev Containers terminal gets:
   container was created with `dctether up` (or by VS Code).
 - **Ports**: the container's `forwardPorts` (and any `-p PORT`) are
   reachable on your host's `127.0.0.1` while a session runs.
+- **Git HTTPS credentials**: git in the container gets credentials from
+  your host's git (its credential helpers, or its password prompt).
+- **gpg**: signing and decryption use your host's gpg-agent, so commit
+  signing works with your host keys.
 
 You don't need VS Code. Nothing is written to `devcontainer.json`, the
 image or shell rc files. The environment is set only on dctether's own
@@ -69,6 +73,8 @@ dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
   --no-x11         don't forward $DISPLAY
   --no-browser     don't set BROWSER
   --no-wayland     don't set WAYLAND_DISPLAY
+  --no-git-credentials  don't answer git's HTTPS credential requests from the host
+  --no-gpg         don't relay gpg-agent (and don't set GNUPGHOME)
   --x11-relay      always relay X11, even if the host display is reachable directly
   -p PORT          also forward host 127.0.0.1:PORT to the container's PORT
   --no-forward     don't forward any ports
@@ -201,6 +207,42 @@ Caveats, and why it can be turned off (`--no-wayland` on `up` or `exec`):
 - **Same user ID.** Compositor sockets are usually accessible only to
   their owner, so the container user needs your host user ID (or root).
 
+### Git HTTPS credentials
+
+dctether adds one credential helper to git through git's environment-only
+configuration (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0=credential.helper`,
+`GIT_CONFIG_VALUE_0`), so no git config file changes. It comes after any
+helpers configured in the container, which are still asked first. The
+helper (`dctether-git-credential`, next to the container binary) sends
+git's request to the host, which answers with `git credential
+fill|approve|reject`: your host's helpers answer, or your host's askpass
+program asks you. Terminal prompts are off on the host side, so they
+can't interfere with your session.
+
+Only `http` and `https` requests and git's documented attributes are
+accepted.
+
+### gpg: a private GNUPGHOME
+
+`dctether exec` sets `GNUPGHOME` to a private directory in the session
+(`/tmp/dctether-XXXX/gnupg`) containing:
+
+- `S.gpg-agent`, relayed to your host gpg-agent's *extra* socket
+  (`gpgconf --list-dirs agent-extra-socket`), the socket gpg-agent
+  provides for forwarding to other machines. The agent runs connections
+  on it in restricted mode (see `--extra-socket` in gpg-agent's manual
+  for what that excludes). Signing and decryption work, with passphrases
+  asked for by your host's pinentry.
+- `pubring.gpg`, the public parts of your host's secret keys (from
+  `gpg --export`), which gpg needs to know which keys the agent holds.
+- `common.conf`, so that gpg uses that keyring file rather than keyboxd.
+
+The container's own `~/.gnupg` isn't touched, and your host keyring
+isn't reachable from the container. Inside a dctether session, gpg
+therefore doesn't see the container's own keys or trust settings. This is
+skipped when the container has no gpg (`gpgconf`), the host has no
+secret keys, or `--no-gpg` is given.
+
 ### Clipboard
 
 There is no separate clipboard forward: programs in the container reach
@@ -258,7 +300,8 @@ this load.
 
 dctether treats the container as untrusted. Even so, every forward gives
 the container real power over your host session. Enable only the forwards
-you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`).
+you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
+`--no-git-credentials`, `--no-gpg`).
 
 - **SSH agent.** While a session is open, any process in the container
   that can reach the socket can ask your agent to sign with your keys.
@@ -283,6 +326,15 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`).
   capture, input emulation, clipboard managers), and which clients may use
   them depends on the compositor. The mount is the compositor's real
   socket, not a relay, and dctether doesn't filter it.
+- **Git credentials.** The container can ask your host's git for
+  credentials of any `http(s)` host, and gets whatever your host's
+  helpers have stored for it (or what you type into the host's prompt).
+  That is the same trade-off as VS Code's credential forwarding. Use
+  `--no-git-credentials` for containers you don't trust with them.
+- **gpg.** While a session is open, anything in the container that can
+  reach the session's socket can ask your gpg-agent to sign or decrypt
+  with your keys. Your host's pinentry asks for the passphrase unless
+  it is cached. The agent serves this socket in restricted mode.
 - **Browser.** The container can ask the host to open URLs. The host
   accepts only `http://` and `https://` URLs of printable ASCII without
   spaces, at most 8 KiB long. It passes the URL to `xdg-open` (or `open` on
@@ -306,10 +358,12 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`).
   line. Host command lines (`ps`) show only the forwarded paths.
 - What the agent reports ends up on the host's `devcontainer` command
   line: the environment for your command, and the default shell. The host
-  accepts only the six variables it expects (`SSH_AUTH_SOCK`, `DISPLAY`,
-  `XAUTHORITY`, `BROWSER`, `DCTETHER_SESSION`, `WAYLAND_DISPLAY`) and only absolute paths
-  (`:<n>` for `DISPLAY`), each passed as a single `--remote-env=K=V`
-  argument.
+  accepts only the variables it expects (`SSH_AUTH_SOCK`, `DISPLAY`,
+  `XAUTHORITY`, `BROWSER`, `DCTETHER_SESSION`, `WAYLAND_DISPLAY`,
+  `GNUPGHOME`, and the three `GIT_CONFIG_*` for the credential helper),
+  only absolute paths (`:<n>` for `DISPLAY`, the exact values for
+  `GIT_CONFIG_COUNT` and `GIT_CONFIG_KEY_0`), each passed as a single
+  `--remote-env=K=V` argument.
 - The agent binary lives in the container user's home, so anything
   running as that user can replace it. The checks above don't depend on
   the agent behaving. One guarantee does: the agent reports the network
@@ -336,7 +390,6 @@ be resolved through mDNS or other NSS-only resolvers. `:0`, `unix:0` and
 
 ## Not supported (yet)
 
-- Git HTTPS credential helper, gpg agent.
 - Automatic port detection (as VS Code does), and ports of other Compose
   services (`"db:5432"`).
 - Forwards end with the `dctether exec` session. Background programs that

@@ -38,7 +38,7 @@ const T_DATA: u8 = 3;
 const T_EOF: u8 = 4;
 const T_CLOSE: u8 = 5;
 
-/// What a channel forwards. The container may only open the first three;
+/// What a channel forwards. The container may open all but `Tcp`;
 /// it never names a host path or address. `Tcp` is opened by the host only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelKind {
@@ -48,6 +48,10 @@ pub enum ChannelKind {
     /// A forwarded port: the agent connects to this port on the
     /// container's loopback.
     Tcp(u16),
+    /// One request from the git credential helper.
+    GitCredential,
+    /// A connection to gpg-agent (the host's restricted extra socket).
+    GpgAgent,
 }
 
 /// Channel ids chosen by the host have this bit set, ids chosen by the
@@ -64,6 +68,8 @@ impl ChannelKind {
                 let [hi, lo] = port.to_be_bytes();
                 vec![4, hi, lo]
             }
+            ChannelKind::GitCredential => vec![5],
+            ChannelKind::GpgAgent => vec![6],
         }
     }
 
@@ -76,7 +82,9 @@ impl ChannelKind {
                 0 => Err(DecodeError::BadPayload("open")),
                 port => Ok(ChannelKind::Tcp(port)),
             },
-            [k, ..] if !(1..=4).contains(k) => Err(DecodeError::UnknownChannelKind(*k)),
+            [5] => Ok(ChannelKind::GitCredential),
+            [6] => Ok(ChannelKind::GpgAgent),
+            [k, ..] if !(1..=6).contains(k) => Err(DecodeError::UnknownChannelKind(*k)),
             _ => Err(DecodeError::BadPayload("open")),
         }
     }
@@ -115,14 +123,7 @@ pub enum Control {
         #[serde(default)]
         container_id: Option<String>,
     },
-    Setup {
-        ssh_agent: bool,
-        browser: bool,
-        x11: Option<X11Offer>,
-        /// Look for the Wayland socket `dctether up` mounts.
-        #[serde(default)]
-        wayland: bool,
-    },
+    Setup(Setup),
     Ready {
         /// Environment for the user's `devcontainer exec`.
         env: Vec<(String, String)>,
@@ -154,6 +155,30 @@ pub struct X11Direct {
 pub struct XAuthCookie {
     pub name: String,
     pub data: Vec<u8>,
+}
+
+/// What the host asks the agent to set up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setup {
+    pub ssh_agent: bool,
+    pub browser: bool,
+    pub x11: Option<X11Offer>,
+    /// Look for the Wayland socket `dctether up` (or VS Code) mounted.
+    #[serde(default)]
+    pub wayland: bool,
+    /// Install the git credential helper.
+    #[serde(default)]
+    pub git_credentials: bool,
+    /// Relay gpg-agent through a private GNUPGHOME.
+    #[serde(default)]
+    pub gpg: Option<GpgOffer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpgOffer {
+    /// `gpg --export` of the host's secret keys: their public parts, which
+    /// gpg in the container needs to know what the agent can sign with.
+    pub public_keys: Vec<u8>,
 }
 
 /// State of the mounted Wayland socket in the container.
@@ -323,6 +348,14 @@ mod tests {
             channel: 10,
             kind: ChannelKind::Tcp(65535),
         });
+        roundtrip(Frame::Open {
+            channel: 11,
+            kind: ChannelKind::GitCredential,
+        });
+        roundtrip(Frame::Open {
+            channel: 12,
+            kind: ChannelKind::GpgAgent,
+        });
         roundtrip(Frame::Eof { channel: 3 });
         roundtrip(Frame::Close { channel: 4 });
         roundtrip(Frame::Control(Control::Hello {
@@ -332,7 +365,7 @@ mod tests {
             shell: None,
             container_id: Some("3b1c42e81917".into()),
         }));
-        roundtrip(Frame::Control(Control::Setup {
+        roundtrip(Frame::Control(Control::Setup(Setup {
             ssh_agent: true,
             browser: false,
             x11: Some(X11Offer {
@@ -346,7 +379,11 @@ mod tests {
                 relay: true,
             }),
             wayland: true,
-        }));
+            git_credentials: true,
+            gpg: Some(GpgOffer {
+                public_keys: vec![0x99, 1, 2],
+            }),
+        })));
         roundtrip(Frame::Control(Control::Ready {
             env: vec![("DISPLAY".into(), ":10".into())],
             x11: Some(X11Ready::Relay {
@@ -367,7 +404,14 @@ mod tests {
     fn wayland_fields_default_when_absent() {
         let setup: Control =
             serde_json::from_str(r#"{"type":"setup","ssh_agent":true,"browser":true,"x11":null}"#).unwrap();
-        assert!(matches!(setup, Control::Setup { wayland: false, .. }));
+        assert_eq!(
+            setup,
+            Control::Setup(Setup {
+                ssh_agent: true,
+                browser: true,
+                ..Setup::default()
+            })
+        );
         let ready: Control = serde_json::from_str(r#"{"type":"ready","env":[],"x11":null}"#).unwrap();
         assert!(matches!(ready, Control::Ready { wayland: None, .. }));
     }

@@ -415,12 +415,8 @@ async fn forwarder(key: &str, dc_args: &[String]) -> Result<(), String> {
     }
     host::send(
         &out,
-        Frame::Control(Control::Setup {
-            ssh_agent: false,
-            browser: false,
-            x11: None,
-            wayland: false,
-        }),
+        // Nothing to set up: this agent only carries forwarded ports.
+        Frame::Control(Control::Setup(Default::default())),
     )
     .await?;
     match reader.next().await {
