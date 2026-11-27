@@ -934,11 +934,22 @@ async fn git_credential_channel(id: u32, mut inbox: mpsc::Receiver<ChanMsg>, out
     reg.remove(id);
 }
 
+/// The host's `git credential SUB`. It runs in `/`, not in our working
+/// directory: that is usually the workspace, which is mounted into the
+/// container, and git would read the `.git/config` there. With
+/// `credential.helper = !cmd` in it, the container could make the host run
+/// a command.
+fn git_credential_command(sub: &str) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(["credential", sub])
+        .current_dir("/")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
 async fn host_git_credential(action: crate::gitcred::Action, attrs: &str) -> Result<String, String> {
     let sub = action.git_subcommand();
-    let mut child = Command::new("git")
-        .args(["credential", sub])
-        .env("GIT_TERMINAL_PROMPT", "0")
+    let mut child = git_credential_command(sub)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -1157,6 +1168,16 @@ mod tests {
         assert!(!ok("DISPLAY", ":0.0"));
         assert!(!ok("DISPLAY", "--x"));
         assert!(is_safe_path("/bin/bash") && !is_safe_path("--docker-path=/x") && !is_safe_path("bash"));
+    }
+
+    /// The workspace is writable by the container, so the host's git must
+    /// not pick up its repository configuration.
+    #[test]
+    fn host_git_credential_runs_outside_the_workspace() {
+        for sub in ["fill", "approve", "reject"] {
+            let cmd = git_credential_command(sub);
+            assert_eq!(cmd.as_std().get_current_dir(), Some(Path::new("/")));
+        }
     }
 
     #[test]

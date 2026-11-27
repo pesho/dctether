@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Git HTTPS credentials: the host's `git credential` ran in the directory
+  `dctether exec` was started from, usually the workspace that is mounted
+  into the container. A process in the container could write
+  `credential.helper = !command` to the workspace's `.git/config` and make
+  the host run that command. The host's git now runs in `/`, so it no
+  longer reads the workspace's repository configuration. Affects 0.4.0;
+  there, `--no-git-credentials` avoids it.
+
 ## [0.4.0] - 2026-11-27
 
 ### Added
