@@ -70,6 +70,8 @@ mount made when the container is created, by `dctether up` or by VS Code
 dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
 
   --no-ssh-agent   don't forward $SSH_AUTH_SOCK
+  --ssh-agent-unfiltered  let the container also add, remove and lock keys in
+                   your SSH agent (default: it can only list keys and sign)
   --no-x11         don't forward $DISPLAY
   --no-browser     don't set BROWSER
   --no-wayland     don't set WAYLAND_DISPLAY
@@ -224,7 +226,17 @@ settings in a repository's own configuration on the host are therefore
 not used.
 
 Only `http` and `https` requests and git's documented attributes are
-accepted.
+accepted. A request for a credential may carry only what git knows when
+it asks (host, path, user name, the server's challenge), never a
+password. Requests are answered one at a time.
+
+Git also tells its helpers when a credential worked (`store`) or was
+rejected (`erase`). The host acts on that only for a credential it handed
+to the container in the same session, and passes its own record of that
+credential to `git credential approve|reject`, not the container's
+request. Anything else is ignored. So a password typed into a prompt
+inside the container is not saved on the host; one typed into the host's
+prompt is.
 
 ### gpg: a private GNUPGHOME
 
@@ -319,6 +331,20 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
   (`ssh-add -c`), or a separate agent holding only the keys this container
   should use. The socket lives in a 0700 directory owned by the container
   user.
+
+  The host passes on only the requests to list keys and to sign, and the
+  `session-bind@openssh.com` extension that `ssh` sends to say which
+  server it is talking to. Requests to add, remove or lock keys, or to
+  load PKCS#11/FIDO provider libraries, are answered with a failure on the
+  host and never reach your agent. Your agent can't hold those back
+  itself: it sees dctether as a local client (see `allow-remote-pkcs11`
+  in ssh-agent's manual). `--ssh-agent-unfiltered` relays everything, for
+  example to run `ssh-add` in the container. The filter goes by the kind
+  of request, so it can't allow one for `ssh-add` and refuse the same one
+  from another program. Tested with OpenSSH 10.2: `ssh-add -l` and
+  `ssh-keygen -Y sign` work in the container, and `ssh-add KEY`, `-d`,
+  `-D` and `-x` report that the agent refused. The `session-bind` case is
+  covered by a unit test only.
 - **X11.** Any client on your X display can read keystrokes and screen
   contents of the other clients on that display, so granting the container
   the display grants that too. In direct mode the container gets your real
@@ -336,8 +362,11 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
 - **Git credentials.** The container can ask your host's git for
   credentials of any `http(s)` host, and gets whatever your host's
   helpers have stored for it (or what you type into the host's prompt).
-  That is the same trade-off as VS Code's credential forwarding. Use
-  `--no-git-credentials` for containers you don't trust with them.
+  That is the same trade-off as VS Code's credential forwarding. It can
+  also make your host forget a credential, but only one it was handed in
+  the same session, and it can't make your host store one of its own
+  choosing. Use `--no-git-credentials` for containers you don't trust
+  with them.
 - **gpg.** While a session is open, anything in the container that can
   reach the session's socket can ask your gpg-agent to sign or decrypt
   with your keys. Your host's pinentry asks for the passphrase unless
@@ -355,12 +384,23 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
 - **Forwarded ports** listen on the host's `127.0.0.1`, so every local
   process on the host can reach those container services, the same as with
   VS Code's forwarding or Docker's `127.0.0.1` publishing. Only ports from
-  your configuration or your `-p` flags are forwarded; the container can't
-  ask for any.
-- The container chooses only a channel *kind* (SSH agent, X11, browser),
-  never a host path or address. Port channels are opened by the host only.
-  The host refuses kinds it didn't offer,
-  caps frames at 1 MiB and allows 256 channels at once.
+  your configuration or your `-p` flags are forwarded, and the container
+  can't ask for any over the protocol. But see the next point: the
+  configuration is usually a file the container can edit.
+- **The workspace is writable by the container**, and that is where
+  `devcontainer.json` normally is. The `devcontainer` CLI reads it on the
+  host for every `exec`, with or without dctether. A container that adds
+  a port to `forwardPorts` there gets it forwarded on your host's
+  `127.0.0.1` by the next session (dctether prints each port it newly
+  forwards; `--no-forward` turns forwarding off). And a `remoteEnv` entry
+  written as `${localEnv:NAME}` copies that variable of your host
+  environment into the container on the next `exec`. Both tested with
+  devcontainer CLI 0.91.0.
+- The container chooses only a channel *kind* (SSH agent, X11, browser,
+  git credential, gpg-agent), never a host path or address. Port channels
+  are opened by the host only. The host refuses kinds it didn't offer,
+  caps data frames at 32 KiB and handshake messages at 1 MiB, and allows
+  256 channels at once.
 - The X cookie goes only through the protocol pipe, never on a command
   line. Host command lines (`ps`) show only the forwarded paths.
 - What the agent reports ends up on the host's `devcontainer` command
@@ -373,11 +413,15 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
   `--remote-env=K=V` argument.
 - The agent binary lives in the container user's home, so anything
   running as that user can replace it. The checks above don't depend on
-  the agent behaving. One guarantee does: the agent reports the network
+  the agent behaving. Two things do. The agent reports the network
   namespace itself, so "the real cookie never enters the container" (relay
   mode) holds only for an unmodified agent. A modified one could claim to
   share the host's namespace and be offered the direct path, cookie
-  included.
+  included. The agent also reports the container's ID, which names the
+  port forwarder that sessions on a container share. A modified one that
+  reported another container's ID could get that container's sessions to
+  use its forwarder, so that their forwarded ports lead to it instead
+  (from reading the code; not tested).
 
 ## Platforms
 

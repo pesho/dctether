@@ -31,8 +31,9 @@ impl Action {
     }
 }
 
-/// Attribute names of git's credential protocol that are passed on. Array
-/// attributes end in `[]`.
+/// Attribute names of git's credential protocol that are accepted. Array
+/// attributes end in `[]`. `url` is not among them: git never sends it to
+/// a helper, and it could carry a user name and password.
 const KEYS: &[&str] = &[
     "protocol",
     "host",
@@ -41,7 +42,6 @@ const KEYS: &[&str] = &[
     "password",
     "password_expiry_utc",
     "oauth_refresh_token",
-    "url",
     "authtype",
     "credential",
     "ephemeral",
@@ -51,11 +51,19 @@ const KEYS: &[&str] = &[
     "state[]",
 ];
 
+/// The attributes a `get` may carry: what git knows when it asks. Never a
+/// secret. `git credential fill` returns a credential that is already
+/// complete in its input as it is, without asking a helper, so a `get`
+/// carrying a password would make the host "hand out" (see [`Served`]) a
+/// credential the container wrote itself.
+const GET_KEYS: &[&str] = &["protocol", "host", "path", "username", "wwwauth[]", "capability[]", "state[]"];
+
 /// Check a request from the (untrusted) container: an action line, then
-/// git's `key=value` lines. Only known keys are accepted, and only for
-/// `http`/`https`, so the container can't ask the host for credentials of
-/// other kinds. Returns the action and the attributes to feed to the
-/// host's `git credential`, terminated by a blank line.
+/// git's `key=value` lines. Only known keys are accepted (for `get`, only
+/// [`GET_KEYS`]), and only for `http`/`https`, so the container can't ask
+/// the host for credentials of other kinds. Returns the action and the
+/// attributes, terminated by a blank line: for `get`, what to feed to the
+/// host's `git credential fill`; for the others, what [`Served`] matches.
 pub fn parse_request(req: &str) -> Result<(Action, String), String> {
     if req.len() > MAX_REQUEST {
         return Err("request too large".into());
@@ -83,18 +91,14 @@ pub fn parse_request(req: &str) -> Result<(Action, String), String> {
         if !KEYS.contains(&key) {
             return Err(format!("unsupported attribute {key:?}"));
         }
+        if action == Action::Get && !GET_KEYS.contains(&key) {
+            return Err(format!("attribute {key:?} is not accepted in a get request"));
+        }
         if value.contains('\r') {
             return Err(format!("{key}: carriage return in value"));
         }
-        match key {
-            "protocol" => protocol = Some(value.to_string()),
-            "url" => {
-                let lower = value.to_ascii_lowercase();
-                if !(lower.starts_with("https://") || lower.starts_with("http://")) {
-                    return Err("only http and https URLs are supported".into());
-                }
-            }
-            _ => {}
+        if key == "protocol" {
+            protocol = Some(value.to_string());
         }
         out.push_str(line);
         out.push('\n');
@@ -106,6 +110,90 @@ pub fn parse_request(req: &str) -> Result<(Action, String), String> {
     }
     out.push('\n');
     Ok((action, out))
+}
+
+/// What tells one credential from another, for matching a `store` or
+/// `erase` request against what the host handed out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Identity {
+    protocol: String,
+    host: String,
+    username: String,
+    password: String,
+}
+
+/// The identity in a list of `key=value` lines (the last value of a key
+/// wins, as in git). `None` unless all four attributes are there and the
+/// password isn't empty, or if there is a `url` line: git would take the
+/// identity from that URL instead, and this doesn't parse URLs.
+fn identity(attrs: &str) -> Option<Identity> {
+    let mut found: [Option<&str>; 4] = [None; 4];
+    for line in attrs.lines().take_while(|l| !l.is_empty()) {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "protocol" => found[0] = Some(value),
+            "host" => found[1] = Some(value),
+            "username" => found[2] = Some(value),
+            "password" => found[3] = Some(value),
+            "url" => return None,
+            _ => {}
+        }
+    }
+    let [protocol, host, username, password] = found.map(|v| v.map(str::to_string));
+    Some(Identity {
+        protocol: protocol?,
+        host: host?,
+        username: username?,
+        password: password.filter(|p| !p.is_empty())?,
+    })
+}
+
+/// Most credentials remembered per session; the oldest is dropped first.
+const MAX_SERVED: usize = 64;
+
+/// The credentials the host's `git credential fill` handed to the
+/// container in this session. The container may have the host `approve` or
+/// `reject` these and no others, and the host's git is then given the
+/// host's own record of the credential, not the container's request.
+///
+/// Credentials without a username and password (git's `authtype` and
+/// `credential` attributes) are not remembered, so `store` and `erase` do
+/// nothing for them.
+#[derive(Default)]
+pub struct Served {
+    list: Vec<(Identity, String)>,
+}
+
+impl Served {
+    /// Remember the output of a successful `git credential fill` on the
+    /// host. An answer without a password (nothing found, and nothing
+    /// typed into the host's prompt) is not a credential.
+    pub fn remember(&mut self, fill_output: &str) {
+        let Some(id) = identity(fill_output) else {
+            return;
+        };
+        self.list.retain(|(known, _)| *known != id);
+        if self.list.len() >= MAX_SERVED {
+            self.list.remove(0);
+        }
+        // As input for `git credential approve|reject`: ends with a blank line.
+        let record = format!("{}\n\n", fill_output.trim_end_matches('\n'));
+        self.list.push((id, record));
+    }
+
+    /// The host's record of the credential a `store` or `erase` request
+    /// names, if this session handed it out.
+    pub fn matching(&self, attrs: &str) -> Option<String> {
+        let id = identity(attrs)?;
+        self.list.iter().find(|(known, _)| *known == id).map(|(_, record)| record.clone())
+    }
+
+    /// Drop the credential a request names, once the host erased it.
+    pub fn forget(&mut self, attrs: &str) {
+        if let Some(id) = identity(attrs) {
+            self.list.retain(|(known, _)| *known != id);
+        }
+    }
 }
 
 /// Container side: `dctether-git-credential ACTION`, run by git with the
@@ -172,7 +260,37 @@ mod tests {
         let (a, _) = parse_request("erase\nprotocol=http\nhost=h\n").unwrap();
         assert_eq!((a, a.git_subcommand()), (Action::Erase, "reject"));
         assert_eq!(Action::Get.git_subcommand(), "fill");
-        assert!(parse_request("get\nprotocol=https\nurl=https://h/x\n").is_ok());
+
+        // What git sends when it asks, challenge and capabilities included.
+        let req = "get\nprotocol=https\nhost=h\npath=o/r.git\nusername=u\ncapability[]=authtype\n\
+                   capability[]=state\nwwwauth[]=Basic realm=\"x\"\nstate[]=helper.k=v\n";
+        assert!(parse_request(req).is_ok());
+    }
+
+    /// The host's `git credential fill` returns a credential that is
+    /// complete in its input unchanged, so a `get` must not carry one.
+    #[test]
+    fn get_carries_no_secrets() {
+        for attr in [
+            "password=planted",
+            "credential=planted",
+            "authtype=Bearer",
+            "oauth_refresh_token=planted",
+            "password_expiry_utc=1",
+            "ephemeral=1",
+            "continue=1",
+            "url=https://planted:planted@h/",
+        ] {
+            let req = format!("get\nprotocol=https\nhost=h\nusername=u\n{attr}\n");
+            assert!(parse_request(&req).is_err(), "{attr}");
+        }
+        // `store` and `erase` describe a credential, so they do carry one.
+        for action in ["store", "erase"] {
+            let req = format!("{action}\nprotocol=https\nhost=h\nusername=u\npassword=p\npassword_expiry_utc=1\n");
+            assert!(parse_request(&req).is_ok(), "{action}");
+            // But never as a URL.
+            assert!(parse_request(&format!("{action}\nprotocol=https\nurl=https://u:p@h/\n")).is_err());
+        }
     }
 
     #[test]
@@ -193,6 +311,68 @@ mod tests {
         }
         let huge = format!("get\nprotocol=https\nhost={}\n", "a".repeat(MAX_REQUEST));
         assert!(parse_request(&huge).is_err());
+    }
+
+    #[test]
+    fn store_and_erase_select_only_what_the_host_handed_out() {
+        // What `git credential fill` printed on the host, extras included.
+        let fill = "protocol=https\nhost=git.example\nusername=me\npassword=s3cret\npassword_expiry_utc=1900000000\n";
+        let mut served = Served::default();
+        served.remember(fill);
+
+        // git in the container reports the same credential back, with a
+        // path the host never printed and attributes of its own.
+        let (_, same) = parse_request(
+            "store\nprotocol=https\nhost=git.example\npath=org/repo.git\nusername=me\npassword=s3cret\n\
+             password_expiry_utc=1\noauth_refresh_token=planted\n",
+        )
+        .unwrap();
+        // The host's git gets the host's own record, not the request.
+        assert_eq!(served.matching(&same).as_deref(), Some(&*format!("{fill}\n")));
+
+        // Anything that differs in protocol, host, user or password names
+        // no credential, and neither does a request with a `url` line.
+        for other in [
+            "protocol=https\nhost=git.example\nusername=me\npassword=other\n\n",
+            "protocol=https\nhost=other.example\nusername=me\npassword=s3cret\n\n",
+            "protocol=http\nhost=git.example\nusername=me\npassword=s3cret\n\n",
+            "protocol=https\nhost=git.example\nusername=you\npassword=s3cret\n\n",
+            "protocol=https\nhost=git.example\nusername=me\n\n",
+            "protocol=https\nhost=git.example\n\n",
+            "protocol=https\nhost=git.example\nusername=me\npassword=s3cret\nurl=https://git.example/\n\n",
+            // The last value of a repeated key counts, as in git.
+            "protocol=https\nhost=git.example\nusername=me\npassword=s3cret\nhost=other.example\n\n",
+            "",
+        ] {
+            assert_eq!(served.matching(other), None, "{other:?}");
+        }
+
+        served.forget(&same);
+        assert_eq!(served.matching(&same), None);
+    }
+
+    #[test]
+    fn empty_answers_are_not_credentials() {
+        let mut served = Served::default();
+        // `fill` exits 0 with these when nothing is stored and the prompt
+        // returns nothing.
+        served.remember("protocol=https\nhost=h\nusername=\npassword=\n");
+        served.remember("protocol=https\nhost=h\n");
+        assert_eq!(served.matching("protocol=https\nhost=h\nusername=\npassword=\n\n"), None);
+        assert!(served.list.is_empty());
+    }
+
+    #[test]
+    fn remembers_a_bounded_number_without_duplicates() {
+        let cred = |n: usize| format!("protocol=https\nhost=h{n}\nusername=u\npassword=p\n");
+        let mut served = Served::default();
+        for n in 0..MAX_SERVED + 5 {
+            served.remember(&cred(n));
+            served.remember(&cred(n));
+        }
+        assert_eq!(served.list.len(), MAX_SERVED);
+        assert_eq!(served.matching(&cred(0)), None);
+        assert!(served.matching(&cred(MAX_SERVED + 4)).is_some());
     }
 
     #[test]
