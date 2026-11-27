@@ -179,12 +179,10 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`).
 brew install pesho/tap/dctether
 ```
 
-> **Note:** the tap isn't published yet.
-
 This also installs the `devcontainer` CLI from Homebrew. Release builds
 are static, so a Linux host build doubles as the container binary for its
-architecture. Each package also includes both Linux container builds in
-`libexec/dctether/`.
+own architecture. The package adds the container build for the other
+Linux architecture (both, on macOS) in `libexec/dctether/`.
 
 ### From source
 
