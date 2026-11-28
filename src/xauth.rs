@@ -168,7 +168,7 @@ mod tests {
     #[test]
     fn roundtrips_entries() {
         let entries = vec![
-            local("PP-FW16", "0", &[1; 16]),
+            local("myhost", "0", &[1; 16]),
             wildcard_entry(0, MIT_MAGIC_COOKIE, &[2; 16]),
             wildcard_entry(1, MIT_MAGIC_COOKIE, &[3; 16]),
         ];

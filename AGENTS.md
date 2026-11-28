@@ -44,9 +44,8 @@ scripts/build-container-binaries.sh         # static musl x86_64 + aarch64 into 
 DCTETHER_AGENT_DIR=$PWD/target/agent DCTETHER_DEBUG=1 target/debug/dctether exec -- true
 ```
 
-- The host's Rust (Fedora package) has no musl target and no rustup, and
-  no clippy. Static builds, clippy and the macOS type-check run in the
-  official Rust image, as in `build-container-binaries.sh`:
+- The host's Rust may have no musl target, rustup or clippy. Static
+  builds, clippy and the macOS type-check run in the official Rust image, as in `build-container-binaries.sh`:
   `cargo clippy --all-targets` and
   `cargo clippy --target aarch64-apple-darwin` (after
   `rustup target add aarch64-apple-darwin` inside the container).
@@ -59,6 +58,12 @@ DCTETHER_AGENT_DIR=$PWD/target/agent DCTETHER_DEBUG=1 target/debug/dctether exec
   hash, so a rebuilt agent is always copied in fresh.
 
 ## Rules
+
+- **Nothing about the user's own machine goes into the repo**, which is
+  public: no paths under their home directory, names of their projects or
+  dev containers, hostnames, or details of their distribution or desktop.
+  That covers files, test fixtures, commit messages and PR text. Write
+  "a host-network dev container", not its name.
 
 - **The container is untrusted.** Everything the agent sends is checked
   on the host: channel kinds, frame sizes, environment variables
@@ -84,16 +89,14 @@ DCTETHER_AGENT_DIR=$PWD/target/agent DCTETHER_DEBUG=1 target/debug/dctether exec
 
 ## Live testing
 
-- The user's real dev containers (`bridge-devcontainer` on the host
-  network, `engine-devcontainer` on the bridge network) are not test
-  fixtures. Read-only checks are fine. Never stop, rebuild or recreate
-  them, and never modify `~/devel/bridge` or `~/devel/engine` without
-  asking.
+- The user's real dev containers are not test fixtures. Read-only checks
+  are fine. Never stop, rebuild or recreate them, and never modify their
+  workspaces without asking.
 - For anything else, create a throwaway dev container from a minimal
   image in a scratch workspace (for example Debian slim plus a UID-1000
   user), and remove the container and its image afterwards. Don't reuse
-  the bridge image: its metadata mounts the user's home volume and runs
-  install hooks.
+  the images of the user's own dev containers: their metadata can mount
+  the user's files and run install hooks.
 - Nothing may open a window on the user's screen without asking. Check
   X11 with `xkbcomp -xkb :0 FILE` and Wayland with `wayland-info` or a raw
   registry request.
