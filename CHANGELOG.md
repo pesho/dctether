@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- If `devcontainer` isn't on `PATH`, dctether now uses the one next to
+  itself (Homebrew installs both into the same `bin`). A terminal
+  profile's command or another program started from a desktop session
+  often runs without Homebrew on `PATH`; `dctether exec` then failed
+  right away. `DCTETHER_DEVCONTAINER` still takes precedence.
+
+### Fixed
+
+- When the devcontainer CLI can't be found or started, dctether says so
+  and stops. `exec --up` reported it as an unreachable container and
+  tried `devcontainer up`, which failed the same way.
+
 ## [0.5.0] - 2026-11-28
 
 ### Added

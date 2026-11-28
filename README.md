@@ -141,9 +141,18 @@ ports last while any session on the container runs.
 
 | Variable | Meaning |
 |---|---|
-| `DCTETHER_DEVCONTAINER` | devcontainer CLI to run (default `devcontainer`) |
+| `DCTETHER_DEVCONTAINER` | devcontainer CLI to run (default `devcontainer` from `PATH`, else the one next to dctether, see below) |
 | `DCTETHER_AGENT_DIR` | directory with `dctether-linux-<arch>` container builds |
 | `DCTETHER_DEBUG=1` | print diagnostics (paths, chosen X11 mode) to stderr |
+
+If `devcontainer` isn't on `PATH`, dctether uses one in its own directory,
+as it was started (`argv[0]`) or as its executable resolves. Homebrew
+installs both into the same `bin`, which programs started from a desktop
+session (a terminal profile's command, for example) often don't have on
+their `PATH`. Tested by running dctether through a symlink next to a
+`devcontainer` symlink, with a `PATH` without either: `exec --up`, the
+port forwarder it starts, and `up` all ran that `devcontainer`. If there
+is none, dctether says so and stops.
 
 ## How it works
 
@@ -254,8 +263,9 @@ only to dctether and the command shuts down with its forwards. With the
 default (`control-group`), systemd signals every process in the unit,
 including the `devcontainer exec` clients. The command still ends, but its
 remaining output and its exit status are lost. Set
-`DCTETHER_DEVCONTAINER` to the CLI's full path if it isn't on the
-service's `PATH` (Homebrew's isn't on systemd's default user `PATH`).
+`DCTETHER_DEVCONTAINER` to the CLI's full path if it is neither on the
+service's `PATH` (Homebrew's isn't on systemd's default user `PATH`) nor
+next to dctether.
 The port forwarder runs in a systemd scope of its own, so stopping the
 unit doesn't take other sessions' ports with it (see
 [Ports](#ports-one-forwarder-per-container)).
