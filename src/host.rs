@@ -168,7 +168,8 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
                 // `devcontainer up` doesn't serialize itself: two at once
                 // create two containers. So one dctether at a time, and the
                 // next one first checks whether that already did it.
-                let _lock = up_lock(&a.dc_args).await;
+                let args = a.dc_args.clone();
+                let _lock = tokio::task::spawn_blocking(move || acquire_up_lock(&args)).await.ok().flatten();
                 match start_agent_with(&dc, &a.dc_args, &bins, true).await {
                     Ok(started) => started,
                     Err(_) => {
@@ -478,16 +479,71 @@ fn wayland_mount() -> Option<String> {
     }
 }
 
-/// Hold an exclusive lock for bringing up the container named by this
-/// working directory and these devcontainer arguments (best effort: the
-/// same container named differently gets a different lock). `None` if
+/// What names the container to `devcontainer`, from its arguments: the
+/// workspace folder, the configuration file and the `--id-label`s (in
+/// order). `None` for options not given.
+pub fn container_identity(dc_args: &[String]) -> (Option<String>, Option<String>, Vec<String>) {
+    let (mut workspace, mut config, mut labels) = (None, None, vec![]);
+    let mut it = dc_args.iter();
+    while let Some(a) = it.next() {
+        let (name, value) = match a.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_string())),
+            None => (a.as_str(), None),
+        };
+        let slot = match name {
+            "--workspace-folder" => &mut workspace,
+            "--config" => &mut config,
+            "--id-label" => {
+                if let Some(v) = value.or_else(|| it.next().cloned()) {
+                    labels.push(v);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        *slot = value.or_else(|| it.next().cloned());
+    }
+    (workspace, config, labels)
+}
+
+/// Name of the lock file for bringing up the container with this identity
+/// (paths already absolute).
+pub fn up_lock_name(workspace: &Path, config: Option<&Path>, labels: &[String]) -> String {
+    let mut h = Sha256::new();
+    h.update(workspace.as_os_str().as_encoded_bytes());
+    h.update([0]);
+    if let Some(c) = config {
+        h.update(c.as_os_str().as_encoded_bytes());
+    }
+    for l in labels {
+        h.update([0]);
+        h.update(l.as_bytes());
+    }
+    let digest = h.finalize();
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("up-{hex}.lock")
+}
+
+/// Hold an exclusive lock for bringing up the container these arguments
+/// name, so that only one `dctether up` or `exec --up` at a time runs
+/// `devcontainer up` for it: the CLI doesn't serialize itself, and two at
+/// once create two containers. Paths are made absolute (relative to the
+/// working directory, as devcontainer does) and resolved, so the same
+/// container named differently gets the same lock. Blocks; `None` if
 /// there's no lock file to use.
-async fn up_lock(dc_args: &[String]) -> Option<std::fs::File> {
+fn acquire_up_lock(dc_args: &[String]) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let key = crate::forward::forwarder_key(None, &cwd, dc_args);
-    let path = crate::forward::runtime_dir().ok()?.join(format!("up-{key}.lock"));
+    let cwd = std::env::current_dir().ok()?;
+    let absolute = |p: &str| {
+        let p = cwd.join(p);
+        p.canonicalize().unwrap_or(p)
+    };
+    let (workspace, config, labels) = container_identity(dc_args);
+    let workspace = absolute(workspace.as_deref().unwrap_or("."));
+    let config = config.as_deref().map(absolute);
+    let name = up_lock_name(&workspace, config.as_deref(), &labels);
+    let path = crate::forward::runtime_dir().ok()?.join(name);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -499,10 +555,7 @@ async fn up_lock(dc_args: &[String]) -> Option<std::fs::File> {
         return Some(file);
     }
     eprintln!("dctether: waiting for another dctether's devcontainer up");
-    tokio::task::spawn_blocking(move || (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(file))
-        .await
-        .ok()
-        .flatten()
+    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(file)
 }
 
 /// `exec --up`: what `dctether up` does, with `exec`'s devcontainer
@@ -533,6 +586,7 @@ async fn bring_up(dc: &str, dc_args: &[String], wayland: bool) -> Result<(), Str
 pub fn up_main(args: &[String]) -> i32 {
     let wayland = !args.iter().any(|a| a == "--no-wayland");
     let mut dc_args: Vec<String> = args.iter().filter(|a| *a != "--no-wayland").cloned().collect();
+    let _lock = acquire_up_lock(&dc_args);
     if wayland && let Some(m) = wayland_mount() {
         dc_args.push(m);
     }
@@ -1648,6 +1702,34 @@ mod tests {
         assert!(parse_exec_args(&s(&["-p"])).is_err());
         assert!(parse_exec_args(&s(&["-p", "0"])).is_err());
         assert!(parse_exec_args(&s(&["-p", "http"])).is_err());
+    }
+
+    #[test]
+    fn finds_what_names_the_container() {
+        assert_eq!(container_identity(&s(&["--log-level", "debug"])), (None, None, vec![]));
+        assert_eq!(
+            container_identity(&s(&[
+                "--workspace-folder",
+                "/w",
+                "--config=c.json",
+                "--id-label",
+                "a=1",
+                "--id-label=b=2",
+                "--remote-env",
+                "X=1",
+            ])),
+            (Some("/w".into()), Some("c.json".into()), s(&["a=1", "b=2"]))
+        );
+    }
+
+    #[test]
+    fn up_lock_depends_only_on_the_identity() {
+        let a = up_lock_name(Path::new("/w"), None, &[]);
+        assert!(a.starts_with("up-") && a.ends_with(".lock"));
+        assert_eq!(a, up_lock_name(Path::new("/w"), None, &[]));
+        assert_ne!(a, up_lock_name(Path::new("/v"), None, &[]));
+        assert_ne!(a, up_lock_name(Path::new("/w"), Some(Path::new("/w/c.json")), &[]));
+        assert_ne!(a, up_lock_name(Path::new("/w"), None, &s(&["a=1"])));
     }
 
     #[test]

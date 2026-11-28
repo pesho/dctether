@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Wayland mount included) if it isn't running or doesn't exist yet, then
   runs the command. A running container is used as it is, without
   running `up` and its `postAttachCommand` again.
+- `dctether up` waits for another `dctether up` or `exec --up` of the same
+  container to finish. Two `devcontainer up` at once create two containers
+  for one workspace.
 
 ### Fixed
 

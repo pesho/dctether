@@ -68,13 +68,18 @@ fails, dctether runs `dctether up` with the same devcontainer options
 again. A running container costs nothing extra, and `up`'s lifecycle
 commands (`postStartCommand`, `postAttachCommand`) run only when it
 actually starts or creates the container. `up`'s output goes to stderr.
-`devcontainer up` doesn't serialize itself (two started at once for a
-workspace create two containers), so dctether runs one at a time per
-working directory and set of devcontainer options, and the ones that
-waited try `exec` again first. Tested with Docker 29.10.1 and
-devcontainer CLI 0.91.0: with no container, a stopped one and a running
-one; and three `exec --up` started at once with no container, which
-created one container and ran its lifecycle commands once.
+Tested with Docker 29.10.1 and devcontainer CLI 0.91.0: with no
+container, a stopped one and a running one.
+
+`devcontainer up` doesn't serialize itself: two started at once for a
+workspace create two containers. So `dctether up` and `exec --up` run it
+one at a time per container, as named by the workspace folder (made
+absolute and resolved), `--config` and `--id-label`. An `exec --up` that
+waited tries `exec` again first; a `dctether up` that waited runs `up`
+as usual. Tested: three `exec --up` started at once with no container
+created one container and ran its lifecycle commands once; `dctether up
+--workspace-folder .`, `dctether up` and `exec --up --workspace-folder
+<absolute path>` started at once also created one.
 `--up` can't be combined with `--container-id`, because `up` finds the
 container from the workspace and configuration. `dctether up` is
 `devcontainer up` plus a mount of your Wayland socket. Wayland needs a
