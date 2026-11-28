@@ -51,6 +51,8 @@ pub struct ExecArgs {
     pub gpg: bool,
     /// From `-p PORT`.
     pub ports: Vec<u16>,
+    /// Start the container (`devcontainer up`) if `exec` can't reach it.
+    pub up: bool,
 }
 
 /// `[options and devcontainer-exec options…] [-- cmd…]`. dctether's own
@@ -74,6 +76,7 @@ pub fn parse_exec_args(args: &[String]) -> Result<ExecArgs, String> {
         ports: vec![],
         git_credentials: true,
         gpg: true,
+        up: false,
     };
     let mut it = before.iter();
     while let Some(arg) = it.next() {
@@ -87,12 +90,22 @@ pub fn parse_exec_args(args: &[String]) -> Result<ExecArgs, String> {
             "--no-git-credentials" => a.git_credentials = false,
             "--no-gpg" => a.gpg = false,
             "--x11-relay" => a.force_relay = true,
+            "--up" => a.up = true,
             "-p" => {
                 let v = it.next().ok_or("-p needs a port number")?;
                 a.ports.push(crate::forward::parse_port(v).ok_or_else(|| format!("-p: bad port {v:?}"))?);
             }
             _ => a.dc_args.push(arg.clone()),
         }
+    }
+    // `up` finds (or creates) the container from the workspace and
+    // configuration; it doesn't take a container ID.
+    if a.up
+        && a.dc_args
+            .iter()
+            .any(|d| d == "--container-id" || d.starts_with("--container-id="))
+    {
+        return Err("--up can't be combined with --container-id: devcontainer up needs the workspace folder or configuration".into());
     }
     Ok(a)
 }
@@ -142,7 +155,32 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     // The host's gpg-agent and public keys, also while the agent starts.
     let gpg = a.gpg.then(|| tokio::task::spawn_blocking(host_gpg));
 
-    let (mut agent, mut reader, stdin) = start_agent(&dc, &a.dc_args, &bins).await?;
+    let (mut agent, mut reader, stdin) = if a.up {
+        // Try first, so that a running container costs nothing extra (and
+        // `up` doesn't run postAttachCommand again). If that fails, most
+        // likely because the container doesn't exist or isn't running,
+        // `up` it and try once more. The first attempt's error output is
+        // held back: `up` shows its own if it fails too.
+        match start_agent_with(&dc, &a.dc_args, &bins, true).await {
+            Ok(started) => started,
+            Err(f) => {
+                crate::debug!("{}: {}", f.message, String::from_utf8_lossy(&f.held).trim_end());
+                // `devcontainer up` doesn't serialize itself: two at once
+                // create two containers. So one dctether at a time, and the
+                // next one first checks whether that already did it.
+                let _lock = up_lock(&a.dc_args).await;
+                match start_agent_with(&dc, &a.dc_args, &bins, true).await {
+                    Ok(started) => started,
+                    Err(_) => {
+                        bring_up(&dc, &a.dc_args, a.wayland).await?;
+                        start_agent(&dc, &a.dc_args, &bins).await?
+                    }
+                }
+            }
+        }
+    } else {
+        start_agent(&dc, &a.dc_args, &bins).await?
+    };
     let (out, out_rx) = mpsc::channel::<Frame>(64);
     let writer = tokio::spawn(mux::write_frames(stdin, out_rx));
 
@@ -415,23 +453,88 @@ fn report_wayland(status: Option<WaylandStatus>) {
 /// `devcontainer up` with the host's Wayland socket mounted, unless
 /// `--no-wayland` is given or there is no Wayland session. All other
 /// arguments go to `devcontainer up` unchanged.
+/// The `--mount` argument that puts the host's Wayland socket into a new
+/// container, if there is one to mount.
+fn wayland_mount() -> Option<String> {
+    match host_wayland_socket() {
+        None => {
+            crate::debug!("no Wayland session (WAYLAND_DISPLAY unset); not mounting a socket");
+            None
+        }
+        Some(sock) if !is_socket(&sock) => {
+            eprintln!("dctether: {} is not a socket; not mounting Wayland", sock.display());
+            None
+        }
+        Some(sock) => match crate::wayland::mount_arg(&sock) {
+            Ok(m) => {
+                crate::debug!("mounting {} at {}", sock.display(), crate::wayland::CONTAINER_SOCKET);
+                Some(m)
+            }
+            Err(e) => {
+                eprintln!("dctether: {e}; not mounting Wayland");
+                None
+            }
+        },
+    }
+}
+
+/// Hold an exclusive lock for bringing up the container named by this
+/// working directory and these devcontainer arguments (best effort: the
+/// same container named differently gets a different lock). `None` if
+/// there's no lock file to use.
+async fn up_lock(dc_args: &[String]) -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let key = crate::forward::forwarder_key(None, &cwd, dc_args);
+    let path = crate::forward::runtime_dir().ok()?.join(format!("up-{key}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Some(file);
+    }
+    eprintln!("dctether: waiting for another dctether's devcontainer up");
+    tokio::task::spawn_blocking(move || (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(file))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// `exec --up`: what `dctether up` does, with `exec`'s devcontainer
+/// arguments (which `up` all accepts; `--container-id` is refused earlier).
+/// Its result goes to stderr, so that the user's command owns stdout.
+async fn bring_up(dc: &str, dc_args: &[String], wayland: bool) -> Result<(), String> {
+    eprintln!("dctether: can't reach the dev container; running devcontainer up");
+    use std::os::fd::AsFd;
+    let to_stderr = std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| e.to_string())?;
+    let status = Command::new(dc)
+        .arg("up")
+        .args(dc_args)
+        .args(wayland.then(wayland_mount).flatten())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(to_stderr))
+        .status()
+        .await
+        .map_err(|e| format!("{dc}: {e}"))?;
+    if !status.success() {
+        return Err(format!("devcontainer up failed ({status})"));
+    }
+    Ok(())
+}
+
 pub fn up_main(args: &[String]) -> i32 {
     let wayland = !args.iter().any(|a| a == "--no-wayland");
     let mut dc_args: Vec<String> = args.iter().filter(|a| *a != "--no-wayland").cloned().collect();
-    if wayland {
-        match host_wayland_socket() {
-            None => crate::debug!("no Wayland session (WAYLAND_DISPLAY unset); not mounting a socket"),
-            Some(sock) if !is_socket(&sock) => {
-                eprintln!("dctether: {} is not a socket; not mounting Wayland", sock.display())
-            }
-            Some(sock) => match crate::wayland::mount_arg(&sock) {
-                Ok(m) => {
-                    crate::debug!("mounting {} at {}", sock.display(), crate::wayland::CONTAINER_SOCKET);
-                    dc_args.push(m);
-                }
-                Err(e) => eprintln!("dctether: {e}; not mounting Wayland"),
-            },
-        }
+    if wayland && let Some(m) = wayland_mount() {
+        dc_args.push(m);
     }
     let dc = std::env::var("DCTETHER_DEVCONTAINER").unwrap_or_else(|_| "devcontainer".into());
     match std::process::Command::new(&dc).arg("up").args(&dc_args).status() {
@@ -767,6 +870,26 @@ pub(crate) async fn start_agent(
     dc_args: &[String],
     bins: &[AgentBinary],
 ) -> Result<(Child, AgentReader, tokio::process::ChildStdin), String> {
+    start_agent_with(dc, dc_args, bins, false).await.map_err(|f| f.message)
+}
+
+/// Why the agent didn't start, and with `hold`, what `devcontainer exec`
+/// wrote to stderr meanwhile.
+pub(crate) struct StartFailure {
+    pub message: String,
+    pub held: Vec<u8>,
+}
+
+/// With `hold`, the agent's stderr is kept back until it has started (then
+/// it is passed on, and from then on as it comes), and returned on failure
+/// instead of being shown.
+pub(crate) async fn start_agent_with(
+    dc: &str,
+    dc_args: &[String],
+    bins: &[AgentBinary],
+    hold: bool,
+) -> Result<(Child, AgentReader, tokio::process::ChildStdin), StartFailure> {
+    let fail = |message: String| StartFailure { message, held: vec![] };
     let names: Vec<_> = bins.iter().map(|b| (b.arch, b.cache_name())).collect();
     let script = boot_script(&names, crate::debug_enabled());
     for attempt in 0..2 {
@@ -776,36 +899,105 @@ pub(crate) async fn start_agent(
             .args(["sh", "-c", &script])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .stderr(if hold {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::inherit()
+            })
             // Keep terminal signals (Ctrl-C meant for the user's command)
             // away from the relay.
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("{dc}: {e}"))?;
+            .map_err(|e| fail(format!("{dc}: {e}")))?;
+        let held = child.stderr.take().map(HeldStderr::start);
         let stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
         let line = read_boot_line(&mut stdout)
             .await
-            .map_err(|e| format!("reading from container: {e}"))?;
+            .map_err(|e| fail(format!("reading from container: {e}")))?;
         match line.as_deref() {
-            Some("ok") => return Ok((child, FrameReader::new(stdout), stdin)),
+            Some("ok") => {
+                if let Some(h) = held {
+                    h.release();
+                }
+                return Ok((child, FrameReader::new(stdout), stdin));
+            }
             Some(l) if l.starts_with("missing ") && attempt == 0 => {
                 let arch = &l["missing ".len()..];
                 drop(stdin);
                 let _ = child.wait().await;
+                if let Some(h) = held {
+                    h.release();
+                }
                 let bin = bins
                     .iter()
                     .find(|b| b.arch == arch)
-                    .ok_or_else(|| format!("no dctether build for container architecture {arch:?}"))?;
-                upload(dc, dc_args, bin).await?;
+                    .ok_or_else(|| fail(format!("no dctether build for container architecture {arch:?}")))?;
+                upload(dc, dc_args, bin).await.map_err(fail)?;
             }
             _ => {
-                let status = child.wait().await.map_err(|e| e.to_string())?;
-                return Err(format!("could not start the container agent ({status})"));
+                let status = child.wait().await.map_err(|e| fail(e.to_string()))?;
+                let held = match held {
+                    Some(h) => h.collect().await,
+                    None => vec![],
+                };
+                return Err(StartFailure {
+                    message: format!("could not start the container agent ({status})"),
+                    held,
+                });
             }
         }
     }
-    Err("container agent still missing after upload".into())
+    Err(fail("container agent still missing after upload".into()))
+}
+
+/// A child's stderr, buffered until [`release`](Self::release) passes it on
+/// to ours, or [`collect`](Self::collect) returns it.
+struct HeldStderr {
+    /// `Some` while holding.
+    buf: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl HeldStderr {
+    fn start(mut err: tokio::process::ChildStderr) -> HeldStderr {
+        let buf = Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+        let b = buf.clone();
+        let task = tokio::spawn(async move {
+            use std::io::Write;
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = err.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                let mut held = b.lock().unwrap();
+                match held.as_mut() {
+                    // Bounded: only error output before the agent starts.
+                    Some(v) if v.len() < 64 * 1024 => v.extend_from_slice(&chunk[..n]),
+                    Some(_) => {}
+                    None => {
+                        let _ = std::io::stderr().write_all(&chunk[..n]);
+                    }
+                }
+            }
+        });
+        HeldStderr { buf, task }
+    }
+
+    /// Show what was held, and pass on the rest as it comes.
+    fn release(self) {
+        use std::io::Write;
+        if let Some(v) = self.buf.lock().unwrap().take() {
+            let _ = std::io::stderr().write_all(&v);
+        }
+    }
+
+    /// Everything the child wrote (it has exited).
+    async fn collect(self) -> Vec<u8> {
+        let _ = self.task.await;
+        self.buf.lock().unwrap().take().unwrap_or_default()
+    }
 }
 
 /// The first line starting with `dctether-boot `, without that prefix.
@@ -1456,6 +1648,19 @@ mod tests {
         assert!(parse_exec_args(&s(&["-p"])).is_err());
         assert!(parse_exec_args(&s(&["-p", "0"])).is_err());
         assert!(parse_exec_args(&s(&["-p", "http"])).is_err());
+    }
+
+    #[test]
+    fn parses_up() {
+        assert!(!parse_exec_args(&s(&[])).unwrap().up);
+        let a = parse_exec_args(&s(&["--up", "--workspace-folder", "/w", "--", "--up"])).unwrap();
+        assert!(a.up);
+        assert_eq!(a.dc_args, s(&["--workspace-folder", "/w"]));
+        assert_eq!(a.cmd, s(&["--up"]));
+        // up can't find a container by ID.
+        assert!(parse_exec_args(&s(&["--up", "--container-id", "abc"])).is_err());
+        assert!(parse_exec_args(&s(&["--up", "--container-id=abc"])).is_err());
+        assert!(parse_exec_args(&s(&["--container-id", "abc"])).is_ok());
     }
 
     #[test]

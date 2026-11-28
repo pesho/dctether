@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `dctether exec --up` starts the dev container (with `dctether up`,
+  Wayland mount included) if it isn't running or doesn't exist yet, then
+  runs the command. A running container is used as it is, without
+  running `up` and its `postAttachCommand` again.
+
 ### Fixed
 
 - Your command no longer outlives its session. Docker and Podman don't

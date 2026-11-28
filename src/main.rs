@@ -69,6 +69,8 @@ exec options:
   -p PORT          also forward host 127.0.0.1:PORT to the container's PORT
                    (forwardPorts from the configuration are forwarded by default)
   --no-forward     don't forward any ports
+  --up             if the container isn't running (or doesn't exist), start it
+                   with `dctether up` first
 
 up options:
   --no-wayland     don't mount the Wayland socket
