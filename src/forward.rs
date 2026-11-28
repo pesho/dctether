@@ -211,22 +211,48 @@ pub fn forwarder_key(container_id: Option<&str>, cwd: &Path, dc_args: &[String])
     format!("args-{hex}")
 }
 
+/// How to start the forwarder, in the order tried: each is tried only if
+/// the one before failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// `systemd-run --scope --expand-environment=no`.
+    Scope,
+    /// `systemd-run --scope` without `--expand-environment=no`, which
+    /// systemd before 254 doesn't know. Those versions don't expand
+    /// variables in scope mode; later ones do by default.
+    ScopeOld,
+    Direct,
+}
+
+/// What to try, given whether `systemd-run` is available and whether any
+/// of the forwarder's arguments contains a `$`: those must never go
+/// through `systemd-run` without `--expand-environment=no`, which would
+/// change them on a systemd that expands after all.
+pub fn start_order(systemd_run: bool, dollar: bool) -> Vec<Start> {
+    match (systemd_run, dollar) {
+        (false, _) => vec![Start::Direct],
+        (true, true) => vec![Start::Scope, Start::Direct],
+        (true, false) => vec![Start::Scope, Start::ScopeOld, Start::Direct],
+    }
+}
+
 /// Arguments of `systemd-run` that run `exe forward KEY dc_args…` in a new
 /// transient scope of the user's service manager. A scope keeps our
 /// environment, working directory and file descriptors; only its cgroup is
-/// its own. `--collect` lets the scope go away however it ends.
-pub fn scope_args(exe: &Path, key: &str, dc_args: &[String]) -> Vec<std::ffi::OsString> {
-    let mut v: Vec<std::ffi::OsString> = [
-        "--user",
-        "--scope",
-        "--collect",
-        "--quiet",
-        "--description=dctether port forwarder",
-        "--",
-    ]
-    .iter()
-    .map(Into::into)
-    .collect();
+/// its own. `--collect` lets the scope go away however it ends. With
+/// `no_expand`, systemd-run passes the arguments on unchanged instead of
+/// expanding `${VARIABLE}` in them, which is the default in scope mode on
+/// current systemd (seen with 259; the option exists since 254).
+pub fn scope_args(exe: &Path, key: &str, dc_args: &[String], no_expand: bool) -> Vec<std::ffi::OsString> {
+    let mut v: Vec<std::ffi::OsString> = ["--user", "--scope", "--collect", "--quiet"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    if no_expand {
+        v.push("--expand-environment=no".into());
+    }
+    v.push("--description=dctether port forwarder".into());
+    v.push("--".into());
     v.push(exe.into());
     v.push("forward".into());
     v.push(key.into());
@@ -387,18 +413,23 @@ pub fn attempts_after_disconnect(attempt: u32, up_for: Duration) -> u32 {
 /// before the forwarder listens (no user service manager, for example), the
 /// forwarder is started directly instead.
 async fn start_forwarder(key: &str, dc_args: &[String], p: &Paths) -> Result<Option<UnixStream>, String> {
-    let start = |scoped| spawn_forwarder(key, dc_args, p, scoped).map_err(|e| format!("starting the port forwarder: {e}"));
-    let mut scoped = cfg!(target_os = "linux") && host::which("systemd-run");
-    let mut child = start(scoped)?;
+    let start = |how| spawn_forwarder(key, dc_args, p, how).map_err(|e| format!("starting the port forwarder: {e}"));
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let dollar = exe.to_string_lossy().contains('$') || key.contains('$') || dc_args.iter().any(|a| a.contains('$'));
+    let order = start_order(cfg!(target_os = "linux") && host::which("systemd-run"), dollar);
+    let mut tried = 0;
+    let mut child = start(order[tried])?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let stream = loop {
         if let Ok(s) = UnixStream::connect(&p.socket).await {
             break Some(s);
         }
-        if scoped && matches!(child.try_wait(), Ok(Some(status)) if !status.success()) {
-            crate::debug!("systemd-run --scope failed; starting the port forwarder directly");
-            scoped = false;
-            child = start(false)?;
+        // Only systemd-run fails this early and with an error status; a
+        // forwarder that finds another one running exits successfully.
+        if tried + 1 < order.len() && matches!(child.try_wait(), Ok(Some(status)) if !status.success()) {
+            tried += 1;
+            crate::debug!("starting the port forwarder with {:?} failed; trying {:?}", order[tried - 1], order[tried]);
+            child = start(order[tried])?;
         }
         if tokio::time::Instant::now() >= deadline {
             break None;
@@ -439,8 +470,8 @@ async fn request(stream: UnixStream, ports: &[u16]) -> Result<(UnixStream, Vec<P
 
 /// Start `dctether forward` detached from this session: its own session
 /// (so a closed terminal doesn't kill it), output to its log file, and with
-/// `scoped`, its own systemd scope (see the module comment).
-fn spawn_forwarder(key: &str, dc_args: &[String], p: &Paths, scoped: bool) -> io::Result<std::process::Child> {
+/// `systemd-run`, its own systemd scope (see the module comment).
+fn spawn_forwarder(key: &str, dc_args: &[String], p: &Paths, how: Start) -> io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -448,9 +479,9 @@ fn spawn_forwarder(key: &str, dc_args: &[String], p: &Paths, scoped: bool) -> io
         .mode(0o600)
         .open(&p.log)?;
     let exe = std::env::current_exe()?;
-    let mut cmd = if scoped {
+    let mut cmd = if how != Start::Direct {
         let mut c = std::process::Command::new("systemd-run");
-        c.args(scope_args(&exe, key, dc_args));
+        c.args(scope_args(&exe, key, dc_args, how == Start::Scope));
         c
     } else {
         let mut c = std::process::Command::new(&exe);
@@ -684,7 +715,7 @@ mod tests {
 
     #[test]
     fn builds_the_scope_command() {
-        let args = scope_args(Path::new("/opt/dctether"), "abc123", &s(&["--workspace-folder", "/w"]));
+        let args = scope_args(Path::new("/opt/dctether"), "abc123", &s(&["--workspace-folder", "/w"]), true);
         let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(
             args,
@@ -693,6 +724,7 @@ mod tests {
                 "--scope",
                 "--collect",
                 "--quiet",
+                "--expand-environment=no",
                 "--description=dctether port forwarder",
                 "--",
                 "/opt/dctether",
@@ -702,6 +734,16 @@ mod tests {
                 "/w",
             ]
         );
+    }
+
+    #[test]
+    fn old_systemd_run_gets_no_expand_option_but_never_a_dollar() {
+        let old = scope_args(Path::new("/x"), "k", &[], false);
+        assert!(!old.iter().any(|a| a.to_str().unwrap().starts_with("--expand-environment")));
+        assert_eq!(start_order(false, false), [Start::Direct]);
+        assert_eq!(start_order(false, true), [Start::Direct]);
+        assert_eq!(start_order(true, false), [Start::Scope, Start::ScopeOld, Start::Direct]);
+        assert_eq!(start_order(true, true), [Start::Scope, Start::Direct]);
     }
 
     #[test]

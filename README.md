@@ -393,8 +393,12 @@ All sessions on a container share one forwarder process
    sharing the session's. Otherwise, when the session runs in a systemd
    unit, stopping that unit, or its main process exiting, would make
    systemd kill the forwarder along with it, while other sessions still
-   use it. If `systemd-run` isn't installed or can't reach a user service
-   manager (as under cron or a system service), the forwarder is started
+   use it. It passes `--expand-environment=no`, so `systemd-run` hands the
+   forwarder its arguments unchanged (by default it expands `${VARIABLE}`
+   in them). systemd before 254 doesn't know that option; then the scope
+   is started without it, unless an argument contains a `$`. If
+   `systemd-run` isn't installed or can't reach a user service manager
+   (as under cron or a system service), the forwarder is started
    directly, as before.
 2. The forwarder runs its own container agent and listens on the host
    ports. Each connection becomes a channel to the agent, which connects
@@ -431,6 +435,10 @@ Debian dev container:
 - Two sessions starting at once still shared one forwarder.
 - Without `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`, `systemd-run`
   failed and the forwarder was started directly.
+- An argument containing `${HOME}` and `$$` reached the forwarder
+  unchanged with systemd 259. With a stand-in for an older `systemd-run`
+  that rejects `--expand-environment`, the forwarder got a scope without
+  the option, or was started directly when an argument contained a `$`.
 
 Ports are only added, never removed: a port one session added with `-p`
 stays forwarded until the last session ends. A container on the host's
