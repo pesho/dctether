@@ -157,21 +157,24 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
                 // next one first checks whether that already did it.
                 let args = a.dc_args.clone();
                 let _lock = tokio::task::spawn_blocking(move || acquire_up_lock(&args)).await.ok().flatten();
-                match start_agent_with(&dc, &a.dc_args, &bins, true).await {
+                let started = match start_agent_with(&dc, &a.dc_args, &bins, true).await {
+                    // Another dctether brought it up meanwhile.
                     Ok(started) => started,
                     Err(_) => {
                         bring_up(&dc, &a.dc_args, a.wayland).await?;
-                        // Read before `up`, it may have failed: up runs
-                        // initializeCommand, which can generate files the
-                        // configuration refers to (a Dockerfile, say).
-                        // Only if forwarding at all (`--no-forward` leaves
-                        // `config` empty).
-                        if let Some(task) = config.as_mut() {
-                            std::mem::replace(task, read_configuration(&dc, &a.dc_args)).abort();
-                        }
                         start_agent(&dc, &a.dc_args, &bins).await?
                     }
+                };
+                // The configuration was read before the container was up,
+                // by us or by whoever we waited for, and may have failed:
+                // `up` runs initializeCommand, which can generate files the
+                // configuration refers to (a Dockerfile, say). Read it
+                // again, if forwarding at all (`--no-forward` leaves
+                // `config` empty).
+                if let Some(task) = config.as_mut() {
+                    std::mem::replace(task, read_configuration(&dc, &a.dc_args)).abort();
                 }
+                started
             }
         }
     } else {

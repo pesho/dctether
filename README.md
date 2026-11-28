@@ -84,9 +84,11 @@ created one container and ran its lifecycle commands once; `dctether up
 --workspace-folder .`, `dctether up` and `exec --up --workspace-folder
 <absolute path>` started at once also created one, as did `dctether up`
 and `dctether up --config .devcontainer/devcontainer.json`. When `exec
---up` runs `up`, it reads `forwardPorts` again afterwards: `up` runs
+--up` finds the container unreachable at first, it reads `forwardPorts`
+again once the container is up, whoever started it: `up` runs
 `initializeCommand`, which can generate files the configuration needs
-(tested with one that writes the Dockerfile).
+(tested with one that writes the Dockerfile, both with `exec --up`
+running `up` itself and with it waiting for a `dctether up`).
 `--up` can't be combined with `--container-id`, because `up` finds the
 container from the workspace and configuration. `dctether up` is
 `devcontainer up` plus a mount of your Wayland socket. Wayland needs a
