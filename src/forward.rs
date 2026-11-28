@@ -488,6 +488,11 @@ fn spawn_forwarder(key: &str, dc_args: &[String], p: &Paths, how: Start) -> io::
         c.arg("forward").arg(key).args(dc_args);
         c
     };
+    // The CLI as this session found it: the forwarder runs as the resolved
+    // executable, which may not be where the CLI was found next to us.
+    if let Ok(dc) = host::devcontainer_cli() {
+        cmd.env("DCTETHER_DEVCONTAINER", dc);
+    }
     cmd.stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -549,7 +554,7 @@ async fn forwarder(key: &str, dc_args: &[String]) -> Result<(), String> {
     eprintln!("dctether forward {} for {key}: starting", crate::VERSION);
 
     // Our own agent in the container, for host-opened channels only.
-    let dc = std::env::var("DCTETHER_DEVCONTAINER").unwrap_or_else(|_| "devcontainer".into());
+    let dc = host::devcontainer_cli()?;
     let bins = host::locate_binaries()?;
     let (mut agent, mut reader, stdin) = host::start_agent(&dc, dc_args, &bins).await?;
     let (out, out_rx) = mpsc::channel::<Frame>(64);

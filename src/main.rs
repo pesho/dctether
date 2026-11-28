@@ -76,7 +76,8 @@ up options:
   --no-wayland     don't mount the Wayland socket
 
 Environment:
-  DCTETHER_DEVCONTAINER  devcontainer CLI to run (default: devcontainer)
+  DCTETHER_DEVCONTAINER  devcontainer CLI to run (default: devcontainer from PATH,
+                         else the one next to dctether)
   DCTETHER_AGENT_DIR     directory with dctether-linux-<arch> container builds
   DCTETHER_DEBUG=1       print diagnostics to stderr
 ";

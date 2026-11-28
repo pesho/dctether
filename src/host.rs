@@ -132,7 +132,7 @@ pub fn exec_main(args: &[String]) -> i32 {
 }
 
 async fn run(a: ExecArgs) -> Result<i32, String> {
-    let dc = std::env::var("DCTETHER_DEVCONTAINER").unwrap_or_else(|_| "devcontainer".into());
+    let dc = devcontainer_cli()?;
     let bins = locate_binaries()?;
 
     // `forwardPorts` comes from the configuration on the host; read it while
@@ -150,6 +150,7 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
         // held back: `up` shows its own if it fails too.
         match start_agent_with(&dc, &a.dc_args, &bins, true).await {
             Ok(started) => started,
+            Err(f) if !f.ran => return Err(f.message),
             Err(f) => {
                 crate::debug!("{}: {}", f.message, String::from_utf8_lossy(&f.held).trim_end());
                 // `devcontainer up` doesn't serialize itself: two at once
@@ -590,11 +591,17 @@ async fn bring_up(dc: &str, dc_args: &[String], wayland: bool) -> Result<(), Str
 pub fn up_main(args: &[String]) -> i32 {
     let wayland = !args.iter().any(|a| a == "--no-wayland");
     let mut dc_args: Vec<String> = args.iter().filter(|a| *a != "--no-wayland").cloned().collect();
+    let dc = match devcontainer_cli() {
+        Ok(dc) => dc,
+        Err(e) => {
+            eprintln!("dctether: {e}");
+            return 1;
+        }
+    };
     let _lock = acquire_up_lock(&dc_args);
     if wayland && let Some(m) = wayland_mount() {
         dc_args.push(m);
     }
-    let dc = std::env::var("DCTETHER_DEVCONTAINER").unwrap_or_else(|_| "devcontainer".into());
     match std::process::Command::new(&dc).arg("up").args(&dc_args).status() {
         Ok(s) => exit_code(s),
         Err(e) => {
@@ -952,6 +959,9 @@ pub(crate) async fn start_agent(
 pub(crate) struct StartFailure {
     pub message: String,
     pub held: Vec<u8>,
+    /// `devcontainer exec` ran (and failed), as opposed to not starting at
+    /// all; only then can `up` help.
+    pub ran: bool,
 }
 
 /// With `hold`, the agent's stderr is kept back until it has started (then
@@ -963,7 +973,11 @@ pub(crate) async fn start_agent_with(
     bins: &[AgentBinary],
     hold: bool,
 ) -> Result<(Child, AgentReader, tokio::process::ChildStdin), StartFailure> {
-    let fail = |message: String| StartFailure { message, held: vec![] };
+    let fail = |message: String| StartFailure {
+        message,
+        held: vec![],
+        ran: true,
+    };
     let names: Vec<_> = bins.iter().map(|b| (b.arch, b.cache_name())).collect();
     let script = boot_script(&names, crate::debug_enabled());
     for attempt in 0..2 {
@@ -983,7 +997,10 @@ pub(crate) async fn start_agent_with(
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| fail(format!("{dc}: {e}")))?;
+            .map_err(|e| StartFailure {
+                ran: false,
+                ..fail(format!("{dc}: {e}"))
+            })?;
         let held = child.stderr.take().map(HeldStderr::start);
         let stdin = child.stdin.take().unwrap();
         let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -1019,6 +1036,7 @@ pub(crate) async fn start_agent_with(
                 return Err(StartFailure {
                     message: format!("could not start the container agent ({status})"),
                     held,
+                    ran: true,
                 });
             }
         }
@@ -1620,6 +1638,50 @@ pub fn secret_key_fingerprints(colons: &str) -> Vec<String> {
     out
 }
 
+/// The devcontainer CLI to run: `DCTETHER_DEVCONTAINER` if set, else
+/// `devcontainer` from `PATH`, else one next to dctether. Homebrew installs
+/// both into the same `bin`, which isn't on `PATH` for programs started
+/// from a desktop session (a terminal profile's command, say). "Next to"
+/// means the directory dctether was run from (`argv[0]`, Homebrew's `bin`)
+/// or that of its resolved executable.
+pub(crate) fn devcontainer_cli() -> Result<String, String> {
+    if let Some(v) = std::env::var_os("DCTETHER_DEVCONTAINER").filter(|v| !v.is_empty()) {
+        return Ok(v.to_string_lossy().into_owned());
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let invoked = std::env::args_os()
+        .next()
+        .map(PathBuf::from)
+        .filter(|p| p.components().count() > 1)
+        .map(|p| cwd.join(p));
+    let dirs: Vec<PathBuf> = [invoked, std::env::current_exe().ok()]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
+    choose_devcontainer(which("devcontainer"), &dirs, is_executable).ok_or_else(|| {
+        "can't find the devcontainer CLI: it isn't on PATH or next to dctether. \
+         Install @devcontainers/cli, or set DCTETHER_DEVCONTAINER to its path"
+            .to_string()
+    })
+}
+
+/// See [`devcontainer_cli`].
+pub fn choose_devcontainer(on_path: bool, dirs: &[PathBuf], usable: impl Fn(&Path) -> bool) -> Option<String> {
+    if on_path {
+        return Some("devcontainer".into());
+    }
+    dirs.iter()
+        .map(|d| d.join("devcontainer"))
+        .find(|p| usable(p))
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 pub(crate) fn which(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
@@ -1759,6 +1821,18 @@ mod tests {
         let ab = up_lock_name(Path::new("/w"), &s(&["a=1", "b=2"]));
         assert_eq!(ab, up_lock_name(Path::new("/w"), &s(&["b=2", "a=1", "b=2"])));
         assert_ne!(ab, l);
+    }
+
+    #[test]
+    fn finds_devcontainer_next_to_dctether() {
+        let dirs = [PathBuf::from("/brew/bin"), PathBuf::from("/brew/Cellar/dctether/0.5.0/bin")];
+        // On PATH: as is, found by the system.
+        assert_eq!(choose_devcontainer(true, &dirs, |_| false).as_deref(), Some("devcontainer"));
+        // Else the first directory that has one.
+        let found = choose_devcontainer(false, &dirs, |p| p == Path::new("/brew/bin/devcontainer"));
+        assert_eq!(found.as_deref(), Some("/brew/bin/devcontainer"));
+        assert_eq!(choose_devcontainer(false, &dirs, |_| false), None);
+        assert_eq!(choose_devcontainer(false, &[], |_| true), None);
     }
 
     #[test]
