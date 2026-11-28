@@ -11,6 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -211,11 +212,21 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     )
     .await?;
 
-    let (env, x11_ready) = match reader.next().await {
-        Ok(Some(Frame::Control(Control::Ready { env, x11, wayland }))) => {
+    let (env, x11_ready, launcher) = match reader.next().await {
+        Ok(Some(Frame::Control(Control::Ready {
+            env,
+            x11,
+            wayland,
+            launcher,
+        }))) => {
             check_env(&env)?;
+            // On the host's command line: an absolute path only, so it
+            // can't be taken for a devcontainer option.
+            if launcher.as_deref().is_some_and(|l| !is_safe_path(l)) {
+                return Err("container agent reported an invalid launcher path".into());
+            }
             report_wayland(wayland);
-            (env, x11)
+            (env, x11, launcher)
         }
         Ok(Some(Frame::Control(Control::Error { message }))) => {
             return Err(message.chars().filter(|c| !c.is_control()).collect());
@@ -252,6 +263,7 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     });
     let reg = Arc::new(Registry::default());
     let mut relay_task = tokio::spawn(host_read_loop(reader, reg, out.clone(), ctx));
+    let agent_alive = Arc::new(AtomicBool::new(true));
 
     // Ports. Held for the whole session: the open connection is what keeps
     // the container's port forwarder alive.
@@ -274,14 +286,34 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
         // One token, so the value can never be parsed as an option.
         user.arg(format!("--remote-env={k}={v}"));
     }
+    // `dctether run` ties the command to the session, so that it ends with
+    // it (see procs.rs): Docker and Podman don't end it when its exec
+    // client goes away.
+    match &launcher {
+        Some(l) => user.arg(l).arg("run"),
+        None => {
+            crate::debug!("no launcher reported; the command may outlive the session");
+            &mut user
+        }
+    };
     user.args(&cmd);
     let mut child = user.spawn().map_err(|e| format!("{dc}: {e}"))?;
-    forward_signals(child.id());
+    let child_running = Arc::new(AtomicBool::new(true));
+    forward_signals(
+        child.id(),
+        launcher.is_some().then(|| out.clone()),
+        agent_alive.clone(),
+        child_running.clone(),
+    );
 
     let status = loop {
         tokio::select! {
-            s = child.wait() => break s.map_err(|e| e.to_string())?,
+            s = child.wait() => {
+                child_running.store(false, Ordering::Relaxed);
+                break s.map_err(|e| e.to_string())?
+            }
             r = &mut relay_task, if !relay_task.is_finished() => {
+                agent_alive.store(false, Ordering::Relaxed);
                 let why = r.unwrap_or_else(|e| e.to_string());
                 eprintln!("\r\ndctether: forwarding stopped: {why}\r");
             }
@@ -496,10 +528,23 @@ fn exit_code(s: ExitStatus) -> i32 {
     s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
 }
 
+/// How long the agent gets to end the command after `Stop`: its own grace
+/// period before SIGKILL (10 s, see procs.rs), plus a margin.
+const STOP_FALLBACK: Duration = Duration::from_secs(15);
+
 /// While the user's command runs, terminal signals reach it directly (it is
 /// in our process group); we only make sure they don't kill the relay, and
 /// pass on termination requests aimed at us.
-fn forward_signals(pid: Option<u32>) {
+///
+/// The first SIGTERM or SIGHUP asks the agent to end the command in the
+/// container (`Stop`), so it shuts down with its forwards still up and its
+/// exit status comes back through `devcontainer exec`. Signalling the
+/// `devcontainer exec` client instead would only end the client. A second
+/// one, one after the agent is gone, or one while the command doesn't run
+/// under the launcher (`out` is `None`) goes to the client as before; so
+/// does the first if the command is still running [`STOP_FALLBACK`] later
+/// (for example because it couldn't register with the agent).
+fn forward_signals(pid: Option<u32>, out: Option<Out>, agent_alive: Arc<AtomicBool>, child_running: Arc<AtomicBool>) {
     let (Ok(mut int), Ok(mut quit), Ok(mut term), Ok(mut hup)) = (
         signal(SignalKind::interrupt()),
         signal(SignalKind::quit()),
@@ -508,18 +553,40 @@ fn forward_signals(pid: Option<u32>) {
     ) else {
         return;
     };
+    // Only while the child is unreaped, so its PID can't belong to another
+    // process yet.
     let kill = move |sig| {
-        if let Some(pid) = pid {
+        if let Some(pid) = pid
+            && child_running.load(Ordering::Relaxed)
+        {
             unsafe { libc::kill(pid as i32, sig) };
         }
     };
     tokio::spawn(async move {
+        let mut stop_sent = false;
         loop {
-            tokio::select! {
-                _ = int.recv() => {}
-                _ = quit.recv() => {}
-                _ = term.recv() => kill(libc::SIGTERM),
-                _ = hup.recv() => kill(libc::SIGHUP),
+            let sig = tokio::select! {
+                _ = int.recv() => continue,
+                _ = quit.recv() => continue,
+                _ = term.recv() => libc::SIGTERM,
+                _ = hup.recv() => libc::SIGHUP,
+            };
+            let asked = !stop_sent
+                && agent_alive.load(Ordering::Relaxed)
+                && out
+                    .as_ref()
+                    .is_some_and(|o| o.try_send(Frame::Control(Control::Stop)).is_ok());
+            if asked {
+                crate::debug!("asking the agent to end the command (signal {sig})");
+                stop_sent = true;
+                let kill = kill.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(STOP_FALLBACK).await;
+                    crate::debug!("the command is still running; signalling devcontainer exec");
+                    kill(sig);
+                });
+            } else {
+                kill(sig);
             }
         }
     });

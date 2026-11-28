@@ -95,7 +95,11 @@ than `--no-wayland` goes to `devcontainer up`.
 
 The command's exit status becomes dctether's. When stdin is a terminal,
 `devcontainer exec` allocates a pty as usual, and window size changes and
-Ctrl-C behave as in a plain `devcontainer exec`.
+Ctrl-C behave as in a plain `devcontainer exec`. The command ends with the
+session, even when dctether itself is stopped or killed, and so does
+anything it leaves running in the background, unless that detached itself
+(see [When a session ends](#when-a-session-ends)). This also makes
+`dctether exec` usable as a service, for example under systemd.
 
 Each forward is active only if the host has it: `SSH_AUTH_SOCK` must be
 set, `DISPLAY` must name a reachable X server, and for Wayland
@@ -141,16 +145,103 @@ dctether exec ──devcontainer exec─────────▶ dctether age
    creates a session directory (mode 0700) and Unix sockets in it, and
    reports back the environment to use.
 3. dctether runs your command in a second `devcontainer exec`, adding
-   that environment with `--remote-env`. Every connection to one of the
+   that environment with `--remote-env`, and starts it through `dctether
+   run`, which ties it to the session (see
+   [When a session ends](#when-a-session-ends)). Every connection to one of the
    agent's sockets becomes a channel. On the host, the matching channel
    connects to the SSH agent or the X server, or receives a URL.
 4. When your command exits, dctether closes the agent's stdin. The agent
-   then removes its session directory and sockets. This also happens when
-   the host side is killed (`SIGKILL` included), because the agent sees
-   end-of-file on its stdin.
+   then ends whatever is left of your command's session, and removes its
+   session directory and sockets. This also happens when the host side is
+   killed (`SIGKILL` included), because the agent sees end-of-file on its
+   stdin.
 
 A session costs two `devcontainer exec` calls, about 1 s in total on the
 author's machine, and a third the first time a version is used.
+
+### When a session ends
+
+Docker and Podman don't end a process started by `exec` when its client
+goes away ([moby/moby#9098](https://github.com/moby/moby/issues/9098)), with
+or without a tty. Stopping or killing `dctether exec`, or the
+`devcontainer exec` it runs, would leave your command running in the
+container, without its forwards. So the host runs your command as
+`<agent binary> run COMMAND...`. That process registers with the agent
+through `run.sock` in the session directory (the agent takes its PID from
+the socket's peer credentials) and then replaces itself with your command
+(`exec`, same PID). Docker and Podman start every `exec` as the leader of
+a new session, so your command and everything it starts stay in that
+session unless they leave it.
+
+When the session ends, the agent sends SIGTERM to every process still in
+that session. If your command has a terminal, it also gets SIGHUP, as on
+a terminal hangup: interactive shells ignore SIGTERM, but on SIGHUP they
+pass it on to their jobs and exit. Whatever is left after 10 seconds gets
+SIGKILL. In practice:
+
+- Background jobs your command leaves behind end with the session,
+  including ones started with `nohup`, which only ignores SIGHUP.
+- Programs that start a session of their own keep running, as they would
+  after closing a terminal: `setsid`, daemons that detach themselves, a
+  `tmux` server. They have no forwards once the session is over.
+- SIGTERM or SIGHUP sent to `dctether exec` asks the agent to end the
+  command first, while the forwards are still up, so it can shut down
+  using them and its exit status becomes dctether's. A second signal goes
+  to `devcontainer exec`, as before, and so does the first if the command
+  is still running 15 seconds later (for example because it couldn't
+  register; this fallback is untested).
+- dctether waits up to 5 seconds for the agent after your command exits.
+  A leftover background job that ignores SIGTERM therefore delays
+  dctether's exit by those 5 seconds; the agent still kills it after its
+  10.
+- If the agent can't signal a process, it stays. The agent runs as the
+  container user, so it can't signal root processes: a command started
+  with `sudo` ends through sudo passing SIGTERM on to it. One that ignores
+  SIGTERM survives when it runs without a terminal (with a terminal,
+  sudo's own pty handling ends it).
+- If the command can't register (for example because its runtime didn't
+  make it a session leader), it runs anyway, with a warning that it may
+  outlive the session.
+
+As a systemd service, use `KillMode=mixed`, so that systemd sends SIGTERM
+only to dctether and the command shuts down with its forwards. With the
+default (`control-group`), systemd signals every process in the unit,
+including the `devcontainer exec` clients. The command still ends, but its
+remaining output and its exit status are lost. Set
+`DCTETHER_DEVCONTAINER` to the CLI's full path if it isn't on the
+service's `PATH` (Homebrew's isn't on systemd's default user `PATH`). A
+port forwarder started from the unit runs in its cgroup and stops with
+it, so other sessions on the same container lose their forwarded ports.
+
+Tested with Docker 29.10.1, devcontainer CLI 0.91.0 and a Debian dev
+container (on the bridge network):
+
+- SIGTERM to dctether: the command gets SIGTERM, a request to the
+  forwarded SSH agent from its signal handler still works, and its exit
+  status comes back.
+- SIGKILL to dctether without a terminal: the command ends.
+- With a terminal, an interactive shell at its prompt with a background
+  job: both end within 0.1 s of a SIGKILL to dctether, and also when the
+  host terminal is closed.
+- A command that ignores SIGTERM: killed after 10 seconds, exit status
+  137. With a second SIGTERM, dctether exits with 143 after the 5-second
+  wait for the agent, and the command is still killed on time.
+- `sudo sleep` ends; `sudo` running a command that ignores SIGTERM stays,
+  as described above (Debian's sudo 1.9.13p3, no terminal).
+- A background job ends with the command; a `setsid` one stays.
+- Ending one session leaves another session on the same container alone.
+- Exit status, piped stdin and a missing command (127) behave as before,
+  and so does the time of `dctether exec -- true`. A background job that
+  keeps the command's output open makes `devcontainer exec` return about
+  2 seconds after the command, before this change too.
+- `systemd-run --user`, stopped with both kill modes: no processes left.
+  With `DCTETHER_DEVCONTAINER` set and systemd's default `PATH`, the
+  service starts.
+
+The behaviour of `exec` itself (session leader, left running after its
+client is stopped or killed) was also seen with plain `docker exec` on a
+container on the host's network, and with rootless Podman 5.8.9 (`podman
+exec`); dctether itself is untested with Podman.
 
 ### X11: direct and relayed
 
@@ -410,13 +501,15 @@ you need (`--no-ssh-agent`, `--no-x11`, `--no-browser`, `--no-wayland`,
 - The X cookie goes only through the protocol pipe, never on a command
   line. Host command lines (`ps`) show only the forwarded paths.
 - What the agent reports ends up on the host's `devcontainer` command
-  line: the environment for your command, and the default shell. The host
+  line: the environment for your command, the default shell, and the path
+  of its own binary, which runs your command (`dctether run`). The host
   accepts only the variables it expects (`SSH_AUTH_SOCK`, `DISPLAY`,
   `XAUTHORITY`, `BROWSER`, `DCTETHER_SESSION`, `WAYLAND_DISPLAY`,
   `GNUPGHOME`, and the three `GIT_CONFIG_*` for the credential helper),
   only absolute paths (`:<n>` for `DISPLAY`, the exact values for
   `GIT_CONFIG_COUNT` and `GIT_CONFIG_KEY_0`), each passed as a single
-  `--remote-env=K=V` argument.
+  `--remote-env=K=V` argument. The shell and the binary's path must be
+  absolute paths.
 - The agent binary lives in the container user's home, so anything
   running as that user can replace it. The checks above don't depend on
   the agent behaving. "The real cookie never enters the container" (relay
@@ -454,8 +547,12 @@ be resolved through mDNS or other NSS-only resolvers. `:0`, `unix:0` and
 
 - Automatic port detection (as VS Code does), and ports of other Compose
   services (`"db:5432"`).
-- Forwards end with the `dctether exec` session. Background programs that
-  outlive it lose them.
+- Forwards end with the `dctether exec` session. Programs that start a
+  session of their own (`setsid`, daemons) keep running without them;
+  everything else ends with it (see
+  [When a session ends](#when-a-session-ends)).
+- A port forwarder started from a systemd unit stops with that unit, even
+  while other sessions on the container still use it.
 - Flow control is a small bounded queue per channel. When one is full,
   reading from the pipe pauses. An X client that stops reading its socket
   can therefore stall the session's other forwards until it reads again or

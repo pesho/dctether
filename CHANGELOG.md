@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Your command no longer outlives its session. Docker and Podman don't
+  end a process started by `exec` when its client goes away, so when
+  `dctether exec` was stopped (SIGTERM, `systemctl stop`) or killed, the
+  command kept running in the container without its forwards, with or
+  without a terminal. The command now runs through `dctether run`, which
+  registers it with the container agent, and when the session ends the
+  agent ends the command's process session: SIGTERM (plus SIGHUP when it
+  has a terminal), then SIGKILL after 10 seconds.
+
+### Changed
+
+- Background jobs that your command leaves in its session now end with
+  the session, including `nohup` ones. Programs that start a session of
+  their own (`setsid`, self-detaching daemons, a `tmux` server) keep
+  running, as before.
+- SIGTERM or SIGHUP sent to `dctether exec` now first asks the agent to
+  end the command, so it shuts down with its forwards still up and its
+  exit status becomes dctether's. Previously it went to the
+  `devcontainer exec` client, which left the command running. A second
+  signal goes to the client, as before.
+- `DCTETHER_SESSION` is now always set in the command's environment.
+
 ## [0.4.1] - 2026-11-27
 
 ### Security
