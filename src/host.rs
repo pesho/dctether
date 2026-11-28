@@ -164,8 +164,10 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
                         // Read before `up`, it may have failed: up runs
                         // initializeCommand, which can generate files the
                         // configuration refers to (a Dockerfile, say).
-                        if let Some(old) = config.replace(read_configuration(&dc, &a.dc_args)) {
-                            old.abort();
+                        // Only if forwarding at all (`--no-forward` leaves
+                        // `config` empty).
+                        if let Some(task) = config.as_mut() {
+                            std::mem::replace(task, read_configuration(&dc, &a.dc_args)).abort();
                         }
                         start_agent(&dc, &a.dc_args, &bins).await?
                     }
@@ -508,8 +510,12 @@ pub fn up_lock_name(workspace: &Path, labels: &[String]) -> String {
         h.update(b"workspace\0");
         h.update(workspace.as_os_str().as_encoded_bytes());
     } else {
+        // devcontainer matches all the labels, in any order.
+        let mut labels = labels.to_vec();
+        labels.sort();
+        labels.dedup();
         h.update(b"labels");
-        for l in labels {
+        for l in &labels {
             h.update([0]);
             h.update(l.as_bytes());
         }
@@ -1746,6 +1752,10 @@ mod tests {
         assert_ne!(a, l);
         assert_eq!(l, up_lock_name(Path::new("/v"), &s(&["a=1"])));
         assert_ne!(l, up_lock_name(Path::new("/w"), &s(&["a=2"])));
+        // Order and repeats don't matter.
+        let ab = up_lock_name(Path::new("/w"), &s(&["a=1", "b=2"]));
+        assert_eq!(ab, up_lock_name(Path::new("/w"), &s(&["b=2", "a=1", "b=2"])));
+        assert_ne!(ab, l);
     }
 
     #[test]
