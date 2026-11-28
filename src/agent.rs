@@ -119,18 +119,15 @@ pub async fn main() -> i32 {
     if let Some(task) = stopping {
         let _ = task.await;
     }
-    let left = leaders.lock().unwrap().clone();
+    let left = leaders.lock().unwrap().leaders();
     crate::procs::end(&left).await;
     drop(session); // removes the session directory and relay socket
     status
 }
 
-/// Commands registered with this session (`dctether run`).
-type Leaders = Arc<std::sync::Mutex<Vec<crate::procs::Leader>>>;
-
-/// More than one `dctether run` per session is unusual (the host starts
-/// one); this only bounds what the container can make the agent hold.
-const MAX_LEADERS: usize = 16;
+/// Commands registered with this session (`dctether run`), and signals
+/// held for them.
+type Leaders = Arc<std::sync::Mutex<crate::procs::Tracked>>;
 
 async fn register_loop(listener: UnixListener, leaders: Leaders) {
     use tokio::io::AsyncWriteExt;
@@ -151,16 +148,18 @@ async fn register_loop(listener: UnixListener, leaders: Leaders) {
                 crate::procs::Leader::from_registrant(pid, &st)
             });
         let ok = match leader {
-            Ok(l) => {
-                let mut v = leaders.lock().unwrap();
-                if v.len() < MAX_LEADERS {
+            Ok(l) => match leaders.lock().unwrap().register(l) {
+                Some(held) => {
                     crate::debug!("tracking session of {}", l.pid);
-                    v.push(l);
+                    // Before the answer, so the command doesn't start.
+                    for sig in held {
+                        crate::debug!("signal {sig} held for {}", l.pid);
+                        unsafe { libc::kill(l.pid, sig) };
+                    }
                     true
-                } else {
-                    false
                 }
-            }
+                None => false,
+            },
             Err(e) => {
                 crate::debug!("not tracking a registrant: {e}");
                 false
@@ -182,7 +181,7 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
             // End the user's command; keep relaying while it shuts down.
             Ok(Some(Frame::Control(Control::Stop))) => {
                 if stopping.is_none() {
-                    let left = leaders.lock().unwrap().clone();
+                    let left = leaders.lock().unwrap().deliver(libc::SIGTERM);
                     *stopping = Some(tokio::spawn(async move { crate::procs::end(&left).await }));
                 }
             }
@@ -191,7 +190,7 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
                     crate::proto::Interrupt::Int => libc::SIGINT,
                     crate::proto::Interrupt::Quit => libc::SIGQUIT,
                 };
-                let left = leaders.lock().unwrap().clone();
+                let left = leaders.lock().unwrap().deliver(sig);
                 crate::procs::interrupt(&left, sig);
             }
             // A forwarded port: the host accepted a connection on its side.
