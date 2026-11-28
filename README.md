@@ -200,7 +200,8 @@ SIGKILL. In practice:
   stdin, dctether starts the command's `devcontainer exec` in a process
   group of its own, so that a Ctrl-C on your terminal reaches only
   dctether and is passed on once (not when that terminal has `tostop`
-  set, which would stop the client's output).
+  set, which would stop the client's output). If the agent is gone, the
+  signal goes to the client instead, which ends dctether.
 - dctether waits up to 5 seconds for the agent after your command exits.
   A leftover background job that ignores SIGTERM therefore delays
   dctether's exit by those 5 seconds; the agent still kills it after its
@@ -213,6 +214,9 @@ SIGKILL. In practice:
 - If the command can't register (for example because its runtime didn't
   make it a session leader), it runs anyway, with a warning that it may
   outlive the session.
+- If the agent itself is killed in the container (SIGKILL), nothing is
+  left to end the command, and it keeps running (seen in a test that
+  killed the agent).
 
 As a systemd service, use `KillMode=mixed`, so that systemd sends SIGTERM
 only to dctether and the command shuts down with its forwards. With the

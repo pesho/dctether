@@ -580,7 +580,8 @@ fn user_command_group() -> bool {
 /// terminal is in raw mode and the keystroke itself travels to the
 /// container's pty. Without one, the `devcontainer exec` client runs in a
 /// process group of its own (see `user_command_group`), so a Ctrl-C on the
-/// terminal reaches only us and is passed on once.
+/// terminal reaches only us and is passed on once. If the agent is gone,
+/// they go to the client instead, as before.
 ///
 /// The first SIGTERM or SIGHUP asks the agent to end the command in the
 /// container (`Stop`), so it shuts down with its forwards still up and its
@@ -637,8 +638,15 @@ fn forward_signals(pid: Option<u32>, out: Option<Out>, agent_alive: Arc<AtomicBo
             };
             if sig == libc::SIGINT || sig == libc::SIGQUIT {
                 let signal = if sig == libc::SIGINT { Interrupt::Int } else { Interrupt::Quit };
-                let sent = ask(Control::Interrupt { signal });
-                crate::debug!("signal {sig}: {}", if sent { "passed on to the command" } else { "ignored" });
+                if ask(Control::Interrupt { signal }) {
+                    crate::debug!("signal {sig}: passed on to the command");
+                } else {
+                    // The agent is gone (or the command isn't tied to it):
+                    // end the invocation as Ctrl-C did before the client
+                    // had a process group of its own.
+                    crate::debug!("signal {sig}: no agent to pass it to; signalling devcontainer exec");
+                    kill(sig);
+                }
                 continue;
             }
             if !stop_sent && ask(Control::Stop) {
