@@ -589,7 +589,8 @@ fn user_command_group() -> bool {
 /// one, one after the agent is gone, or one while the command doesn't run
 /// under the launcher (`out` is `None`) goes to the client as before; so
 /// does the first if the command is still running [`STOP_FALLBACK`] later
-/// (for example because it couldn't register with the agent).
+/// (for example because it couldn't register with the agent, or the frame
+/// queue to it stayed full).
 fn forward_signals(pid: Option<u32>, out: Option<Out>, agent_alive: Arc<AtomicBool>, child_running: Arc<AtomicBool>) {
     let (Ok(mut int), Ok(mut quit), Ok(mut term), Ok(mut hup)) = (
         signal(SignalKind::interrupt()),
@@ -608,6 +609,23 @@ fn forward_signals(pid: Option<u32>, out: Option<Out>, agent_alive: Arc<AtomicBo
             unsafe { libc::kill(pid as i32, sig) };
         }
     };
+    // Control messages for the agent go through their own task, which waits
+    // for room in the frame queue (it also carries forwarded data, and is
+    // full while a channel is backed up) and keeps their order. Nothing is
+    // dropped, and this loop never waits, so a second SIGTERM still reaches
+    // the client right away.
+    let to_agent = out.map(|out| {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Control>();
+        tokio::spawn(async move {
+            while let Some(c) = rx.recv().await {
+                if out.send(Frame::Control(c)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tx
+    });
+    let ask = move |c: Control| agent_alive.load(Ordering::Relaxed) && to_agent.as_ref().is_some_and(|t| t.send(c).is_ok());
     tokio::spawn(async move {
         let mut stop_sent = false;
         loop {
@@ -619,19 +637,11 @@ fn forward_signals(pid: Option<u32>, out: Option<Out>, agent_alive: Arc<AtomicBo
             };
             if sig == libc::SIGINT || sig == libc::SIGQUIT {
                 let signal = if sig == libc::SIGINT { Interrupt::Int } else { Interrupt::Quit };
-                let sent = agent_alive.load(Ordering::Relaxed)
-                    && out
-                        .as_ref()
-                        .is_some_and(|o| o.try_send(Frame::Control(Control::Interrupt { signal })).is_ok());
+                let sent = ask(Control::Interrupt { signal });
                 crate::debug!("signal {sig}: {}", if sent { "passed on to the command" } else { "ignored" });
                 continue;
             }
-            let asked = !stop_sent
-                && agent_alive.load(Ordering::Relaxed)
-                && out
-                    .as_ref()
-                    .is_some_and(|o| o.try_send(Frame::Control(Control::Stop)).is_ok());
-            if asked {
+            if !stop_sent && ask(Control::Stop) {
                 crate::debug!("asking the agent to end the command (signal {sig})");
                 stop_sent = true;
                 let kill = kill.clone();
