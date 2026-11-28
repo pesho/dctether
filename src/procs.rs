@@ -99,6 +99,46 @@ pub fn targets(leader: Leader, procs: &[(i32, Stat)], exclude: i32) -> Vec<(i32,
     out
 }
 
+/// Registered commands, and the signals that arrived before any had
+/// registered. A Ctrl-C (or a stop request) can come while `dctether run`
+/// is still starting; it is held and delivered to the command when it
+/// registers, before the agent answers. The command then never starts, as
+/// with Ctrl-C on a command that hasn't started yet.
+#[derive(Debug, Default)]
+pub struct Tracked {
+    leaders: Vec<Leader>,
+    held: Vec<i32>,
+}
+
+/// More than one `dctether run` per session is unusual (the host starts
+/// one); this only bounds what the container can make the agent hold.
+const MAX_LEADERS: usize = 16;
+
+impl Tracked {
+    /// Record `leader`. Returns the held signals to send it now, or `None`
+    /// if too many are registered already.
+    pub fn register(&mut self, leader: Leader) -> Option<Vec<i32>> {
+        if self.leaders.len() >= MAX_LEADERS {
+            return None;
+        }
+        self.leaders.push(leader);
+        Some(std::mem::take(&mut self.held))
+    }
+
+    /// The commands to deliver `sig` to now. When none has registered yet,
+    /// the signal is held instead (each signal once) and none is returned.
+    pub fn deliver(&mut self, sig: i32) -> Vec<Leader> {
+        if self.leaders.is_empty() && !self.held.contains(&sig) {
+            self.held.push(sig);
+        }
+        self.leaders.clone()
+    }
+
+    pub fn leaders(&self) -> Vec<Leader> {
+        self.leaders.clone()
+    }
+}
+
 /// The process group to send an interrupt (SIGINT, SIGQUIT) to, as a
 /// terminal would for Ctrl-C: the foreground group of the command's
 /// terminal if it has one (an interactive shell's running job, or the
@@ -299,6 +339,29 @@ mod tests {
         assert_eq!(interrupt_target(leader, Some(st('S', 10, 0, 999)), 5), None);
         // Never the agent's own group.
         assert_eq!(interrupt_target(leader, Some(fg), 12), None);
+    }
+
+    #[test]
+    fn holds_signals_until_a_command_registers() {
+        let mut t = Tracked::default();
+        assert!(t.deliver(libc::SIGINT).is_empty());
+        assert!(t.deliver(libc::SIGINT).is_empty());
+        assert!(t.deliver(libc::SIGTERM).is_empty());
+        let l = Leader { pid: 10, start: 100 };
+        assert_eq!(t.register(l), Some(vec![libc::SIGINT, libc::SIGTERM]));
+        // Delivered once; later ones go to the command right away.
+        assert_eq!(t.register(Leader { pid: 11, start: 101 }), Some(vec![]));
+        assert_eq!(t.deliver(libc::SIGINT).len(), 2);
+        assert_eq!(t.leaders().len(), 2);
+    }
+
+    #[test]
+    fn bounds_registrations() {
+        let mut t = Tracked::default();
+        for pid in 0..16 {
+            assert!(t.register(Leader { pid: 100 + pid, start: 1 }).is_some());
+        }
+        assert_eq!(t.register(Leader { pid: 200, start: 1 }), None);
     }
 
     #[test]
