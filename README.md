@@ -190,6 +190,17 @@ SIGKILL. In practice:
   to `devcontainer exec`, as before, and so does the first if the command
   is still running 15 seconds later (for example because it couldn't
   register; this fallback is untested).
+- SIGINT or SIGQUIT sent to `dctether exec` goes to the command as Ctrl-C
+  or Ctrl-\ on its terminal would: the agent sends it to the foreground
+  process group of the command's terminal (an interactive shell's running
+  job, or the shell at its prompt), or without a terminal to the
+  command's own process group. Nothing follows if the command ignores it.
+  With a terminal, a typed Ctrl-C goes to the container's pty as a
+  keystroke, as with plain `devcontainer exec`. Without a terminal on
+  stdin, dctether starts the command's `devcontainer exec` in a process
+  group of its own, so that a Ctrl-C on your terminal reaches only
+  dctether and is passed on once (not when that terminal has `tostop`
+  set, which would stop the client's output).
 - dctether waits up to 5 seconds for the agent after your command exits.
   A leftover background job that ignores SIGTERM therefore delays
   dctether's exit by those 5 seconds; the agent still kills it after its
@@ -227,6 +238,14 @@ container (on the bridge network):
 - A command that ignores SIGTERM: killed after 10 seconds, exit status
   137. With a second SIGTERM, dctether exits with 143 after the 5-second
   wait for the agent, and the command is still killed on time.
+- SIGINT to dctether, and Ctrl-C on a terminal while stdin isn't one: the
+  command gets one SIGINT, finishes its handler, and its exit status (130)
+  comes back. The same for SIGINT to dctether with a terminal, and SIGQUIT
+  (131). An interactive shell running `sleep` in the foreground: the job
+  is interrupted and the shell keeps running. Before this, SIGINT to
+  dctether was ignored, and a Ctrl-C without a terminal on stdin killed
+  the `devcontainer exec` client instead, so the command got SIGTERM.
+  With `tostop` set on the terminal, output still appears.
 - `sudo sleep` ends; `sudo` running a command that ignores SIGTERM stays,
   as described above (Debian's sudo 1.9.13p3, no terminal).
 - A background job ends with the command; a `setsid` one stays.
