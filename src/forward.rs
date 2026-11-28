@@ -14,6 +14,13 @@
 //!   and exits a few seconds after the last one is gone.
 //! - An exclusive `flock` on a lock file makes sure only one forwarder per
 //!   container runs, even when several sessions start at once.
+//! - On Linux the forwarder is started in a systemd scope of its own when
+//!   `systemd-run` is available, so it doesn't belong to the cgroup of the
+//!   session that started it: stopping that session's systemd unit would
+//!   otherwise kill it along with the unit, under the other sessions' feet.
+//! - A session whose forwarder goes away anyway (killed, crashed, its
+//!   container agent gone) asks for its ports again, which starts a new
+//!   forwarder if none runs.
 
 use std::collections::HashSet;
 use std::io;
@@ -204,6 +211,36 @@ pub fn forwarder_key(container_id: Option<&str>, cwd: &Path, dc_args: &[String])
     format!("args-{hex}")
 }
 
+/// Arguments of `systemd-run` that run `exe forward KEY dc_args…` in a new
+/// transient scope of the user's service manager. A scope keeps our
+/// environment, working directory and file descriptors; only its cgroup is
+/// its own. `--collect` lets the scope go away however it ends.
+pub fn scope_args(exe: &Path, key: &str, dc_args: &[String]) -> Vec<std::ffi::OsString> {
+    let mut v: Vec<std::ffi::OsString> = [
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        "--description=dctether port forwarder",
+        "--",
+    ]
+    .iter()
+    .map(Into::into)
+    .collect();
+    v.push(exe.into());
+    v.push("forward".into());
+    v.push(key.into());
+    v.extend(dc_args.iter().map(Into::into));
+    v
+}
+
+/// How long to wait before asking for the ports again after the
+/// forwarder went away, by attempt (0 first): quickly at first, then
+/// backing off to every 30 seconds.
+pub fn reattach_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250u64.saturating_mul(1 << attempt.min(7))).min(Duration::from_secs(30))
+}
+
 fn valid_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= 40 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
@@ -268,18 +305,15 @@ pub async fn attach(
     for _ in 0..3 {
         let stream = match UnixStream::connect(&p.socket).await {
             Ok(s) => s,
-            Err(_) => {
-                spawn_forwarder(key, dc_args, &p).map_err(|e| format!("starting the port forwarder: {e}"))?;
-                match wait_for_socket(&p.socket, Duration::from_secs(30)).await {
-                    Some(s) => s,
-                    None => {
-                        return Err(format!(
-                            "the port forwarder didn't start (see {})",
-                            p.log.display()
-                        ));
-                    }
+            Err(_) => match start_forwarder(key, dc_args, &p).await? {
+                Some(s) => s,
+                None => {
+                    return Err(format!(
+                        "the port forwarder didn't start (see {})",
+                        p.log.display()
+                    ));
                 }
-            }
+            },
         };
         match request(stream, ports).await {
             Ok(r) => return Ok(r),
@@ -290,16 +324,92 @@ pub async fn attach(
     Err(format!("port forwarder: {last_err} (see {})", p.log.display()))
 }
 
-async fn wait_for_socket(path: &Path, limit: Duration) -> Option<UnixStream> {
-    let deadline = tokio::time::Instant::now() + limit;
-    while tokio::time::Instant::now() < deadline {
-        if let Ok(s) = UnixStream::connect(path).await {
-            return Some(s);
+/// Hold a session's connection to the forwarder (from [`attach`]) for as
+/// long as this task runs, which is until the session ends and aborts it.
+/// The forwarder sends nothing after its answer, so end-of-file means it is
+/// gone: then ask for `ports` again, which starts a new one.
+pub async fn keep_attached(key: String, dc_args: Vec<String>, ports: Vec<u16>, mut stream: UnixStream) {
+    // Attempts since the forwarder last stayed up for [`STABLE`]: a
+    // forwarder that keeps dying right after it starts is retried less and
+    // less often, and reported once.
+    let mut attempt = 0u32;
+    loop {
+        let up_since = tokio::time::Instant::now();
+        let mut sink = [0u8; 256];
+        while let Ok(n) = stream.read(&mut sink).await {
+            if n == 0 {
+                break;
+            }
+        }
+        attempt = attempts_after_disconnect(attempt, up_since.elapsed());
+        if attempt == 0 {
+            eprintln!("\r\ndctether: the port forwarder stopped; starting it again\r");
+        }
+        let mut failed = false;
+        stream = loop {
+            tokio::time::sleep(reattach_delay(attempt)).await;
+            attempt = attempt.saturating_add(1);
+            match attach(&key, &dc_args, &ports).await {
+                Ok((s, results)) => {
+                    if failed {
+                        eprintln!("\r\ndctether: port forwarding resumed\r");
+                    }
+                    for r in results {
+                        if let PortResult::Failed(p, e) = r {
+                            eprintln!("\r\ndctether: can't forward port {p}: {e}\r");
+                        }
+                    }
+                    break s;
+                }
+                Err(e) => {
+                    if !failed {
+                        eprintln!("\r\ndctether: {e}; retrying\r");
+                        failed = true;
+                    }
+                }
+            }
+        };
+    }
+}
+
+/// A forwarder that stayed up this long counts as working again: the next
+/// time it goes away, re-attaching starts over with the shortest delay.
+const STABLE: Duration = Duration::from_secs(60);
+
+/// The attempt count to continue with after the forwarder went away
+/// `up_for` after the last successful attach.
+pub fn attempts_after_disconnect(attempt: u32, up_for: Duration) -> u32 {
+    if up_for >= STABLE { 0 } else { attempt }
+}
+
+/// Start the forwarder and connect to it once it listens. Through
+/// `systemd-run --scope` where available; if that exits with an error
+/// before the forwarder listens (no user service manager, for example), the
+/// forwarder is started directly instead.
+async fn start_forwarder(key: &str, dc_args: &[String], p: &Paths) -> Result<Option<UnixStream>, String> {
+    let start = |scoped| spawn_forwarder(key, dc_args, p, scoped).map_err(|e| format!("starting the port forwarder: {e}"));
+    let mut scoped = cfg!(target_os = "linux") && host::which("systemd-run");
+    let mut child = start(scoped)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let stream = loop {
+        if let Ok(s) = UnixStream::connect(&p.socket).await {
+            break Some(s);
+        }
+        if scoped && matches!(child.try_wait(), Ok(Some(status)) if !status.success()) {
+            crate::debug!("systemd-run --scope failed; starting the port forwarder directly");
+            scoped = false;
+            child = start(false)?;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break None;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    None
+    };
+    // Reap it if it exits while this session still runs.
+    std::thread::spawn(move || child.wait());
+    Ok(stream)
 }
+
 
 async fn request(stream: UnixStream, ports: &[u16]) -> Result<(UnixStream, Vec<PortResult>), String> {
     let mut stream = BufReader::new(stream);
@@ -328,19 +438,26 @@ async fn request(stream: UnixStream, ports: &[u16]) -> Result<(UnixStream, Vec<P
 }
 
 /// Start `dctether forward` detached from this session: its own session
-/// (so a closed terminal doesn't kill it), output to its log file.
-fn spawn_forwarder(key: &str, dc_args: &[String], p: &Paths) -> io::Result<()> {
+/// (so a closed terminal doesn't kill it), output to its log file, and with
+/// `scoped`, its own systemd scope (see the module comment).
+fn spawn_forwarder(key: &str, dc_args: &[String], p: &Paths, scoped: bool) -> io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(&p.log)?;
-    let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("forward")
-        .arg(key)
-        .args(dc_args)
-        .stdin(std::process::Stdio::null())
+    let exe = std::env::current_exe()?;
+    let mut cmd = if scoped {
+        let mut c = std::process::Command::new("systemd-run");
+        c.args(scope_args(&exe, key, dc_args));
+        c
+    } else {
+        let mut c = std::process::Command::new(&exe);
+        c.arg("forward").arg(key).args(dc_args);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
     unsafe {
@@ -351,10 +468,7 @@ fn spawn_forwarder(key: &str, dc_args: &[String], p: &Paths) -> io::Result<()> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn()?;
-    // Reap it if it exits while this session still runs.
-    std::thread::spawn(move || child.wait());
-    Ok(())
+    cmd.spawn()
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +680,45 @@ mod tests {
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn builds_the_scope_command() {
+        let args = scope_args(Path::new("/opt/dctether"), "abc123", &s(&["--workspace-folder", "/w"]));
+        let args: Vec<&str> = args.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--collect",
+                "--quiet",
+                "--description=dctether port forwarder",
+                "--",
+                "/opt/dctether",
+                "forward",
+                "abc123",
+                "--workspace-folder",
+                "/w",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_forwarder_that_keeps_dying_is_retried_less_often() {
+        // First loss: start over.
+        assert_eq!(attempts_after_disconnect(0, Duration::ZERO), 0);
+        // Died again right after re-attaching: keep backing off.
+        assert_eq!(attempts_after_disconnect(3, Duration::from_secs(1)), 3);
+        // Stayed up for a minute: start over.
+        assert_eq!(attempts_after_disconnect(3, Duration::from_secs(60)), 0);
+    }
+
+    #[test]
+    fn reattach_backs_off_to_thirty_seconds() {
+        let ms: Vec<u128> = (0..10).map(|a| reattach_delay(a).as_millis()).collect();
+        assert_eq!(ms, [250, 500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000]);
+        assert_eq!(reattach_delay(u32::MAX), Duration::from_secs(30));
     }
 
     #[test]
