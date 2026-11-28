@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the frame layout or the control messages change
 /// incompatibly. Both halves are always the same build in practice (the
 /// container half is copied by content hash), so this is a safety net.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub const HEADER_LEN: usize = 9;
 /// Largest payload either side accepts in a control frame (the handshake
@@ -116,7 +116,7 @@ pub enum Frame {
 /// Control messages, exchanged once at startup:
 /// agent → host `Hello`, host → agent `Setup`, agent → host `Ready`.
 /// Before `Setup` the host may send `NetnsProbe`, which the agent answers
-/// with `NetnsProbed`.
+/// with `NetnsProbed`. After `Ready` the host may send `Stop`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
@@ -149,7 +149,17 @@ pub enum Control {
         /// `None` when Wayland was not asked for.
         #[serde(default)]
         wayland: Option<WaylandStatus>,
+        /// The agent's own binary: the host runs the user's command as
+        /// `<launcher> run COMMAND...`, which ties it to the session (see
+        /// `procs.rs`). Ends up on the host's command line, so the host
+        /// checks it like the shell path.
+        #[serde(default)]
+        launcher: Option<String>,
     },
+    /// Host → agent: end the user's command (its session) now, while the
+    /// forwards are still up. The agent keeps running until the host
+    /// closes its stdin.
+    Stop,
     /// Fatal setup error; the sender exits after sending it.
     Error { message: String },
 }
@@ -414,7 +424,9 @@ mod tests {
                 },
             }),
             wayland: Some(WaylandStatus::Dead),
+            launcher: Some("/home/dev/.cache/dctether/x/dctether".into()),
         }));
+        roundtrip(Frame::Control(Control::Stop));
         roundtrip(Frame::Control(Control::Error {
             message: "nope".into(),
         }));
@@ -438,7 +450,7 @@ mod tests {
             })
         );
         let ready: Control = serde_json::from_str(r#"{"type":"ready","env":[],"x11":null}"#).unwrap();
-        assert!(matches!(ready, Control::Ready { wayland: None, .. }));
+        assert!(matches!(ready, Control::Ready { wayland: None, launcher: None, .. }));
     }
 
     #[test]

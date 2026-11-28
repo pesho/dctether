@@ -17,6 +17,8 @@ mod xauth;
 mod agent;
 #[cfg(target_os = "linux")]
 mod netns;
+#[cfg(target_os = "linux")]
+mod procs;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -98,6 +100,8 @@ fn main() {
             // Started by `exec`, not documented as a user command.
             Some("forward") => forward::forwarder_main(&args[2..]),
             Some("agent") => agent_main(&args[2..]),
+            // In the container: what the host runs the user's command under.
+            Some("run") => run_main(&args[2..]),
             Some("browser") => browser_helper(&args[2..]),
             Some("git-credential") => git_credential_helper(&args[2..]),
             Some("--version" | "-V") => {
@@ -132,6 +136,17 @@ fn agent_main(args: &[String]) -> i32 {
 #[cfg(not(target_os = "linux"))]
 fn agent_main(_: &[String]) -> i32 {
     eprintln!("dctether agent runs inside Linux containers only");
+    2
+}
+
+#[cfg(target_os = "linux")]
+fn run_main(args: &[String]) -> i32 {
+    procs::run_main(args)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_main(_: &[String]) -> i32 {
+    eprintln!("dctether run runs inside Linux containers only");
     2
 }
 

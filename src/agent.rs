@@ -85,8 +85,18 @@ pub async fn main() -> i32 {
             env: session.env.clone(),
             x11: session.x11.clone(),
             wayland: session.wayland,
+            launcher: std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string)),
         }))
         .await;
+
+    // The user's command registers itself here (`dctether run`), so its
+    // session can be ended with ours.
+    let leaders: Leaders = Default::default();
+    if let Some(l) = session.run_listener.take() {
+        tokio::spawn(register_loop(l, leaders.clone()));
+    }
 
     let reg = Arc::new(Registry::default());
     let next_id = Arc::new(AtomicU32::new(1));
@@ -97,19 +107,85 @@ pub async fn main() -> i32 {
     let mut term = signal(SignalKind::terminate()).expect("signal handler");
     let mut hup = signal(SignalKind::hangup()).expect("signal handler");
     let mut int = signal(SignalKind::interrupt()).expect("signal handler");
+    let mut stopping = None;
     let status = tokio::select! {
-        s = read_loop(&mut reader, &reg, &out) => s,
+        s = read_loop(&mut reader, &reg, &out, &leaders, &mut stopping) => s,
         _ = term.recv() => 0,
         _ = hup.recv() => 0,
         _ = int.recv() => 0,
     };
+    // The session is over, however it ended: so is the user's command,
+    // along with anything it left in its session.
+    if let Some(task) = stopping {
+        let _ = task.await;
+    }
+    let left = leaders.lock().unwrap().clone();
+    crate::procs::end(&left).await;
     drop(session); // removes the session directory and relay socket
     status
 }
 
-async fn read_loop<R: tokio::io::AsyncRead + Unpin>(reader: &mut FrameReader<R>, reg: &Arc<Registry>, out: &Out) -> i32 {
+/// Commands registered with this session (`dctether run`).
+type Leaders = Arc<std::sync::Mutex<Vec<crate::procs::Leader>>>;
+
+/// More than one `dctether run` per session is unusual (the host starts
+/// one); this only bounds what the container can make the agent hold.
+const MAX_LEADERS: usize = 16;
+
+async fn register_loop(listener: UnixListener, leaders: Leaders) {
+    use tokio::io::AsyncWriteExt;
+    loop {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        // The peer's PID comes from the kernel; it waits for our answer, so
+        // it is still the process that connected when its stat is read.
+        let leader = stream
+            .peer_cred()
+            .ok()
+            .and_then(|c| c.pid())
+            .ok_or("no peer PID")
+            .and_then(|pid| {
+                let st = crate::procs::stat_of(pid).ok_or("no such process")?;
+                crate::procs::Leader::from_registrant(pid, &st)
+            });
+        let ok = match leader {
+            Ok(l) => {
+                let mut v = leaders.lock().unwrap();
+                if v.len() < MAX_LEADERS {
+                    crate::debug!("tracking session of {}", l.pid);
+                    v.push(l);
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(e) => {
+                crate::debug!("not tracking a registrant: {e}");
+                false
+            }
+        };
+        let _ = stream.write_all(if ok { b"1" } else { b"0" }).await;
+    }
+}
+
+async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut FrameReader<R>,
+    reg: &Arc<Registry>,
+    out: &Out,
+    leaders: &Leaders,
+    stopping: &mut Option<tokio::task::JoinHandle<()>>,
+) -> i32 {
     loop {
         match reader.next().await {
+            // End the user's command; keep relaying while it shuts down.
+            Ok(Some(Frame::Control(Control::Stop))) => {
+                if stopping.is_none() {
+                    let left = leaders.lock().unwrap().clone();
+                    *stopping = Some(tokio::spawn(async move { crate::procs::end(&left).await }));
+                }
+            }
             // A forwarded port: the host accepted a connection on its side.
             Ok(Some(Frame::Open {
                 channel,
@@ -209,6 +285,8 @@ struct Session {
     dir: PathBuf,
     x11_socket: Option<PathBuf>,
     listeners: Vec<(UnixListener, ChannelKind)>,
+    /// Where `dctether run` registers the user's command.
+    run_listener: Option<UnixListener>,
     env: Vec<(String, String)>,
     x11: Option<X11Ready>,
     wayland: Option<WaylandStatus>,
@@ -239,6 +317,7 @@ impl Session {
             dir,
             x11_socket: None,
             listeners: vec![],
+            run_listener: None,
             env: vec![],
             x11: None,
             wayland: None,
@@ -255,9 +334,11 @@ impl Session {
             s.set_env("SSH_AUTH_SOCK", &p);
         }
 
-        // Helpers run as separate processes and find the session through
-        // DCTETHER_SESSION.
-        let mut helpers = false;
+        // Helpers, and `dctether run`, run as separate processes and find
+        // the session through DCTETHER_SESSION.
+        s.run_listener = Some(UnixListener::bind(s.dir.join(crate::procs::RUN_SOCKET))?);
+        let dir = s.dir.clone();
+        s.set_env("DCTETHER_SESSION", &dir);
         let exe = std::env::current_exe()?;
 
         if browser {
@@ -265,7 +346,6 @@ impl Session {
             if helper.exists() {
                 listen(&mut s, "browser.sock", ChannelKind::Browser)?;
                 s.set_env("BROWSER", &helper);
-                helpers = true;
             } else {
                 eprintln!("dctether agent: {} is missing; not setting BROWSER", helper.display());
             }
@@ -280,15 +360,9 @@ impl Session {
                 s.env.push(("GIT_CONFIG_COUNT".into(), "1".into()));
                 s.env.push(("GIT_CONFIG_KEY_0".into(), "credential.helper".into()));
                 s.set_env("GIT_CONFIG_VALUE_0", &helper);
-                helpers = true;
             } else {
                 eprintln!("dctether agent: {} is missing; not forwarding git credentials", helper.display());
             }
-        }
-
-        if helpers {
-            let dir = s.dir.clone();
-            s.set_env("DCTETHER_SESSION", &dir);
         }
 
         if let Some(offer) = gpg {
