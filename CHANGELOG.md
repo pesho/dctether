@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-28
+
 ### Changed
 
 - If `devcontainer` isn't on `PATH`, dctether now uses the one next to
@@ -181,7 +183,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release builds for Linux and macOS, and a Homebrew tap:
   `brew install pesho/tap/dctether`.
 
-[Unreleased]: https://github.com/pesho/dctether/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/pesho/dctether/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/pesho/dctether/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/pesho/dctether/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/pesho/dctether/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/pesho/dctether/compare/v0.3.0...v0.4.0
