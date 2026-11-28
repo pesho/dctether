@@ -186,6 +186,14 @@ async fn read_loop<R: tokio::io::AsyncRead + Unpin>(
                     *stopping = Some(tokio::spawn(async move { crate::procs::end(&left).await }));
                 }
             }
+            Ok(Some(Frame::Control(Control::Interrupt { signal }))) => {
+                let sig = match signal {
+                    crate::proto::Interrupt::Int => libc::SIGINT,
+                    crate::proto::Interrupt::Quit => libc::SIGQUIT,
+                };
+                let left = leaders.lock().unwrap().clone();
+                crate::procs::interrupt(&left, sig);
+            }
             // A forwarded port: the host accepted a connection on its side.
             Ok(Some(Frame::Open {
                 channel,

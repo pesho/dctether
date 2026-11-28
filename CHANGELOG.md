@@ -23,6 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sessions on the container lost their forwarded ports. On Linux it now
   starts in a systemd scope of its own (`systemd-run --user --scope`),
   or directly as before where that isn't available.
+- SIGINT and SIGQUIT now reach your command. Sent to `dctether exec`
+  (by a process manager, for example), they were ignored. And a Ctrl-C on
+  your terminal while stdin wasn't one killed the `devcontainer exec`
+  client instead, so the command got SIGTERM and dctether reported the
+  client's exit status. dctether now passes both signals to the command's
+  foreground process group, as Ctrl-C on its terminal would, and without a
+  terminal on stdin starts the command's `devcontainer exec` in its own
+  process group so that Ctrl-C reaches the command only once.
 - A session whose port forwarder goes away (killed, crashed, its
   container agent gone) now asks for its ports again, which starts a new
   forwarder, instead of running on without them.

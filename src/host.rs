@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use crate::browser;
 use crate::mux::{self, ChanMsg, FrameReader, Out, Registry};
 use crate::proto::{
-    ChannelKind, Control, DATA_CHUNK, Frame, GpgOffer, HOST_CHANNEL_BIT, PROTOCOL_VERSION, Setup, WaylandStatus,
+    ChannelKind, Control, DATA_CHUNK, Frame, GpgOffer, HOST_CHANNEL_BIT, Interrupt, PROTOCOL_VERSION, Setup, WaylandStatus,
     X11Direct, X11Offer, X11Ready, XAuthCookie,
 };
 use crate::x11::ClientFilter;
@@ -292,6 +292,9 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     };
     let mut user = Command::new(&dc);
     user.arg("exec").args(&a.dc_args);
+    if user_command_group() {
+        user.process_group(0);
+    }
     for (k, v) in &env {
         // One token, so the value can never be parsed as an option.
         user.arg(format!("--remote-env={k}={v}"));
@@ -553,9 +556,31 @@ fn exit_code(s: ExitStatus) -> i32 {
 /// period before SIGKILL (10 s, see procs.rs), plus a margin.
 const STOP_FALLBACK: Duration = Duration::from_secs(15);
 
-/// While the user's command runs, terminal signals reach it directly (it is
-/// in our process group); we only make sure they don't kill the relay, and
-/// pass on termination requests aimed at us.
+/// Whether to start the user command's `devcontainer exec` in a process
+/// group of its own, out of reach of the terminal's Ctrl-C (which then
+/// reaches only us, and we pass it on). Only without a terminal on stdin:
+/// with one, the client has to stay in the foreground group to read it.
+/// Not when the terminal on stdout or stderr has `tostop` set either, which
+/// would stop a background group's writes to it.
+fn user_command_group() -> bool {
+    let tostop = |fd| {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        unsafe { libc::isatty(fd) == 1 && libc::tcgetattr(fd, &mut t) == 0 && t.c_lflag & libc::TOSTOP != 0 }
+    };
+    let stdin_tty = unsafe { libc::isatty(0) } == 1;
+    !stdin_tty && !tostop(1) && !tostop(2)
+}
+
+/// While the user's command runs, dctether passes on the signals that are
+/// meant for it.
+///
+/// SIGINT and SIGQUIT go to the agent, which sends them to the command's
+/// foreground process group, as Ctrl-C would on its terminal
+/// (`Interrupt`). With a terminal, a typed Ctrl-C doesn't come this way: the
+/// terminal is in raw mode and the keystroke itself travels to the
+/// container's pty. Without one, the `devcontainer exec` client runs in a
+/// process group of its own (see `user_command_group`), so a Ctrl-C on the
+/// terminal reaches only us and is passed on once.
 ///
 /// The first SIGTERM or SIGHUP asks the agent to end the command in the
 /// container (`Stop`), so it shuts down with its forwards still up and its
@@ -587,11 +612,20 @@ fn forward_signals(pid: Option<u32>, out: Option<Out>, agent_alive: Arc<AtomicBo
         let mut stop_sent = false;
         loop {
             let sig = tokio::select! {
-                _ = int.recv() => continue,
-                _ = quit.recv() => continue,
+                _ = int.recv() => libc::SIGINT,
+                _ = quit.recv() => libc::SIGQUIT,
                 _ = term.recv() => libc::SIGTERM,
                 _ = hup.recv() => libc::SIGHUP,
             };
+            if sig == libc::SIGINT || sig == libc::SIGQUIT {
+                let signal = if sig == libc::SIGINT { Interrupt::Int } else { Interrupt::Quit };
+                let sent = agent_alive.load(Ordering::Relaxed)
+                    && out
+                        .as_ref()
+                        .is_some_and(|o| o.try_send(Frame::Control(Control::Interrupt { signal })).is_ok());
+                crate::debug!("signal {sig}: {}", if sent { "passed on to the command" } else { "ignored" });
+                continue;
+            }
             let asked = !stop_sent
                 && agent_alive.load(Ordering::Relaxed)
                 && out

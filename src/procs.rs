@@ -21,6 +21,8 @@ pub struct Stat {
     pub sid: i32,
     /// Controlling terminal, 0 for none.
     pub tty_nr: i32,
+    /// Foreground process group of the controlling terminal, -1 for none.
+    pub tpgid: i32,
     /// Start time in clock ticks since boot: together with the PID, it
     /// identifies a process even after its PID is reused.
     pub start: u64,
@@ -31,12 +33,13 @@ pub struct Stat {
 pub fn parse_stat(s: &str) -> Option<Stat> {
     let rest = &s[s.rfind(')')? + 1..];
     let f: Vec<&str> = rest.split_ascii_whitespace().collect();
-    // After the name: state(3) ppid(4) pgrp(5) session(6) tty_nr(7) ...
-    // starttime(22), numbered as in proc(5).
+    // After the name: state(3) ppid(4) pgrp(5) session(6) tty_nr(7)
+    // tpgid(8) ... starttime(22), numbered as in proc(5).
     Some(Stat {
         state: f.first()?.chars().next()?,
         sid: f.get(3)?.parse().ok()?,
         tty_nr: f.get(4)?.parse().ok()?,
+        tpgid: f.get(5)?.parse().ok()?,
         start: f.get(19)?.parse().ok()?,
     })
 }
@@ -94,6 +97,31 @@ pub fn targets(leader: Leader, procs: &[(i32, Stat)], exclude: i32) -> Vec<(i32,
         }
     }
     out
+}
+
+/// The process group to send an interrupt (SIGINT, SIGQUIT) to, as a
+/// terminal would for Ctrl-C: the foreground group of the command's
+/// terminal if it has one (an interactive shell's running job, or the
+/// shell itself at its prompt), else the command's own group (which, as a
+/// session leader, has its PID as ID). `None` when the command is gone or
+/// its PID belongs to another process now. `own_pgrp` (the agent's) is
+/// never a target.
+pub fn interrupt_target(leader: Leader, now: Option<Stat>, own_pgrp: i32) -> Option<i32> {
+    let st = now.filter(|st| st.start == leader.start && st.sid == leader.pid && !matches!(st.state, 'Z' | 'X'))?;
+    let pgrp = if st.tty_nr != 0 && st.tpgid > 0 { st.tpgid } else { leader.pid };
+    (pgrp > 1 && pgrp != own_pgrp).then_some(pgrp)
+}
+
+/// Send `sig` to the foreground of every registered command (see
+/// [`interrupt_target`]). Nothing escalates: an interrupt may be ignored.
+pub fn interrupt(leaders: &[Leader], sig: i32) {
+    let own = unsafe { libc::getpgrp() };
+    for l in leaders {
+        if let Some(pgrp) = interrupt_target(*l, stat_of(l.pid), own) {
+            crate::debug!("signal {sig} to process group {pgrp}");
+            unsafe { libc::kill(-pgrp, sig) };
+        }
+    }
 }
 
 /// How long processes get to exit after SIGTERM before they get SIGKILL.
@@ -188,13 +216,25 @@ mod tests {
     use super::*;
 
     fn st(state: char, sid: i32, tty_nr: i32, start: u64) -> Stat {
-        Stat { state, sid, tty_nr, start }
+        Stat {
+            state,
+            sid,
+            tty_nr,
+            tpgid: -1,
+            start,
+        }
     }
 
     #[test]
     fn parses_stat_from_the_last_paren() {
         let line = "4242 (a) b (c)) S 1 4242 4242 34816 4242 4194560 108 0 0 0 0 0 0 0 20 0 1 0 987654 2433024 197 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0";
-        assert_eq!(parse_stat(line), Some(st('S', 4242, 34816, 987654)));
+        assert_eq!(
+            parse_stat(line),
+            Some(Stat {
+                tpgid: 4242,
+                ..st('S', 4242, 34816, 987654)
+            })
+        );
         assert_eq!(parse_stat("1 (x) S 0 1"), None);
         assert_eq!(parse_stat("garbage"), None);
     }
@@ -243,6 +283,22 @@ mod tests {
         let leader = Leader { pid: 10, start: 100 };
         let procs = [(11, st('S', 10, 0, 101))];
         assert_eq!(targets(leader, &procs, 0), vec![(11, libc::SIGTERM)]);
+    }
+
+    #[test]
+    fn interrupts_go_to_the_terminal_foreground_or_the_command() {
+        let leader = Leader { pid: 10, start: 100 };
+        // No terminal: the command's own group.
+        assert_eq!(interrupt_target(leader, Some(st('S', 10, 0, 100)), 5), Some(10));
+        // A terminal, an interactive shell running job 12 in the foreground.
+        let fg = Stat { tpgid: 12, ..st('S', 10, 34816, 100) };
+        assert_eq!(interrupt_target(leader, Some(fg), 5), Some(12));
+        // Gone, a zombie, or its PID reused: nothing.
+        assert_eq!(interrupt_target(leader, None, 5), None);
+        assert_eq!(interrupt_target(leader, Some(st('Z', 10, 0, 100)), 5), None);
+        assert_eq!(interrupt_target(leader, Some(st('S', 10, 0, 999)), 5), None);
+        // Never the agent's own group.
+        assert_eq!(interrupt_target(leader, Some(fg), 12), None);
     }
 
     #[test]

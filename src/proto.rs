@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 /// Bumped whenever the frame layout or the control messages change
 /// incompatibly. Both halves are always the same build in practice (the
 /// container half is copied by content hash), so this is a safety net.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 pub const HEADER_LEN: usize = 9;
 /// Largest payload either side accepts in a control frame (the handshake
@@ -116,7 +116,8 @@ pub enum Frame {
 /// Control messages, exchanged once at startup:
 /// agent → host `Hello`, host → agent `Setup`, agent → host `Ready`.
 /// Before `Setup` the host may send `NetnsProbe`, which the agent answers
-/// with `NetnsProbed`. After `Ready` the host may send `Stop`.
+/// with `NetnsProbed`. After `Ready` the host may send `Stop` and
+/// `Interrupt`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Control {
@@ -160,6 +161,9 @@ pub enum Control {
     /// forwards are still up. The agent keeps running until the host
     /// closes its stdin.
     Stop,
+    /// Host → agent: pass this signal on to the user's command, as Ctrl-C
+    /// (or Ctrl-\) on its terminal would.
+    Interrupt { signal: Interrupt },
     /// Fatal setup error; the sender exits after sending it.
     Error { message: String },
 }
@@ -208,6 +212,15 @@ pub struct GpgOffer {
     /// `gpg --export` of the host's secret keys: their public parts, which
     /// gpg in the container needs to know what the agent can sign with.
     pub public_keys: Vec<u8>,
+}
+
+/// Signals the host passes on to the user's command with
+/// `Control::Interrupt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Interrupt {
+    Int,
+    Quit,
 }
 
 /// State of the mounted Wayland socket in the container.
@@ -427,6 +440,8 @@ mod tests {
             launcher: Some("/home/dev/.cache/dctether/x/dctether".into()),
         }));
         roundtrip(Frame::Control(Control::Stop));
+        roundtrip(Frame::Control(Control::Interrupt { signal: Interrupt::Int }));
+        roundtrip(Frame::Control(Control::Interrupt { signal: Interrupt::Quit }));
         roundtrip(Frame::Control(Control::Error {
             message: "nope".into(),
         }));
