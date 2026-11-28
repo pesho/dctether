@@ -73,13 +73,20 @@ container, a stopped one and a running one.
 
 `devcontainer up` doesn't serialize itself: two started at once for a
 workspace create two containers. So `dctether up` and `exec --up` run it
-one at a time per container, as named by the workspace folder (made
-absolute and resolved), `--config` and `--id-label`. An `exec --up` that
+one at a time per container, as named by its `--id-label`s or else its
+workspace folder (made absolute and resolved). The configuration file
+isn't part of that, so that the default one and the same file named with
+`--config` share a lock; two configurations in one workspace only wait
+for each other. An `exec --up` that
 waited tries `exec` again first; a `dctether up` that waited runs `up`
 as usual. Tested: three `exec --up` started at once with no container
 created one container and ran its lifecycle commands once; `dctether up
 --workspace-folder .`, `dctether up` and `exec --up --workspace-folder
-<absolute path>` started at once also created one.
+<absolute path>` started at once also created one, as did `dctether up`
+and `dctether up --config .devcontainer/devcontainer.json`. When `exec
+--up` runs `up`, it reads `forwardPorts` again afterwards: `up` runs
+`initializeCommand`, which can generate files the configuration needs
+(tested with one that writes the Dockerfile).
 `--up` can't be combined with `--container-id`, because `up` finds the
 container from the workspace and configuration. `dctether up` is
 `devcontainer up` plus a mount of your Wayland socket. Wayland needs a
