@@ -266,9 +266,19 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
     let agent_alive = Arc::new(AtomicBool::new(true));
 
     // Ports. Held for the whole session: the open connection is what keeps
-    // the container's port forwarder alive.
+    // the container's port forwarder alive. If the forwarder goes away, the
+    // task asks for the ports again.
     let _forwarder = match config {
-        Some(config) => forward_ports(&a, config, netns.as_deref(), container_id.as_deref()).await,
+        Some(config) => forward_ports(&a, config, netns.as_deref(), container_id.as_deref())
+            .await
+            .map(|(key, ports, stream)| {
+                AbortOnDrop(tokio::spawn(crate::forward::keep_attached(
+                    key,
+                    a.dc_args.clone(),
+                    ports,
+                    stream,
+                )))
+            }),
         None => None,
     };
 
@@ -440,12 +450,23 @@ type ConfigTask = tokio::task::JoinHandle<io::Result<std::process::Output>>;
 /// Make the container's port forwarder forward `forwardPorts` plus `-p`
 /// ports, and report what happened. Problems are reported, not fatal: the
 /// session itself still works.
+/// Ends a task when dropped (a dropped `JoinHandle` only detaches it).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Attach to the container's port forwarder. Returns the forwarder key, the
+/// ports asked for and the connection to hold.
 async fn forward_ports(
     a: &ExecArgs,
     config: ConfigTask,
     netns: Option<&str>,
     container_id: Option<&str>,
-) -> Option<UnixStream> {
+) -> Option<(String, Vec<u16>, UnixStream)> {
     let mut ports = vec![];
     match config.await {
         Ok(Ok(o)) if o.status.success() => match crate::forward::config_ports(&String::from_utf8_lossy(&o.stdout)) {
@@ -491,7 +512,7 @@ async fn forward_ports(
                     crate::forward::PortResult::Failed(p, e) => eprintln!("dctether: can't forward port {p}: {e}"),
                 }
             }
-            Some(stream)
+            Some((key, ports, stream))
         }
         Err(e) => {
             eprintln!("dctether: {e}");
@@ -1281,7 +1302,7 @@ pub fn secret_key_fingerprints(colons: &str) -> Vec<String> {
     out
 }
 
-fn which(cmd: &str) -> bool {
+pub(crate) fn which(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
 }

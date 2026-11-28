@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registers it with the container agent, and when the session ends the
   agent ends the command's process session: SIGTERM (plus SIGHUP when it
   has a terminal), then SIGKILL after 10 seconds.
+- The port forwarder no longer stops with the systemd unit of the session
+  that happened to start it. It shared that session's cgroup, so stopping
+  the unit (or the unit's main process exiting) killed it, and the other
+  sessions on the container lost their forwarded ports. On Linux it now
+  starts in a systemd scope of its own (`systemd-run --user --scope`),
+  or directly as before where that isn't available.
+- A session whose port forwarder goes away (killed, crashed, its
+  container agent gone) now asks for its ports again, which starts a new
+  forwarder, instead of running on without them.
 
 ### Changed
 

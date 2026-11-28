@@ -209,9 +209,10 @@ default (`control-group`), systemd signals every process in the unit,
 including the `devcontainer exec` clients. The command still ends, but its
 remaining output and its exit status are lost. Set
 `DCTETHER_DEVCONTAINER` to the CLI's full path if it isn't on the
-service's `PATH` (Homebrew's isn't on systemd's default user `PATH`). A
-port forwarder started from the unit runs in its cgroup and stops with
-it, so other sessions on the same container lose their forwarded ports.
+service's `PATH` (Homebrew's isn't on systemd's default user `PATH`).
+The port forwarder runs in a systemd scope of its own, so stopping the
+unit doesn't take other sessions' ports with it (see
+[Ports](#ports-one-forwarder-per-container)).
 
 Tested with Docker 29.10.1, devcontainer CLI 0.91.0 and a Debian dev
 container (on the bridge network):
@@ -387,6 +388,14 @@ All sessions on a container share one forwarder process
    `$XDG_RUNTIME_DIR/dctether/`, named after the container's ID. If none
    answers, the session starts it in the background, detached from the
    terminal. A lock file ensures there is only ever one per container.
+   On Linux the session starts it with `systemd-run --user --scope`, so
+   the forwarder gets a systemd scope (cgroup) of its own instead of
+   sharing the session's. Otherwise, when the session runs in a systemd
+   unit, stopping that unit, or its main process exiting, would make
+   systemd kill the forwarder along with it, while other sessions still
+   use it. If `systemd-run` isn't installed or can't reach a user service
+   manager (as under cron or a system service), the forwarder is started
+   directly, as before.
 2. The forwarder runs its own container agent and listens on the host
    ports. Each connection becomes a channel to the agent, which connects
    to the same port inside the container. The session prints which ports
@@ -396,6 +405,32 @@ All sessions on a container share one forwarder process
    kernel closes it when the session ends, however it ends. Five seconds
    after the last session is gone, the forwarder stops and the ports
    close.
+4. If the forwarder goes away while a session runs (it was killed, it
+   crashed, or its container agent ended), the session sees its control
+   connection close, says so, and asks for its ports again, which starts
+   a new forwarder. It retries after 0.25 s, then less and less often,
+   down to every 30 seconds, and keeps backing off while forwarders die
+   again within a minute of starting. Connections open through the old forwarder
+   are lost, and so is a port that only sessions which have already
+   ended had asked for.
+
+Tested with Docker 29.10.1 and devcontainer CLI 0.91.0 on a bridge-network
+Debian dev container:
+
+- A forwarder started from a `systemd-run --user` unit ran in its own
+  scope and kept serving another session's port after `systemctl --user
+  stop` of that unit (default KillMode), and after the unit's command
+  exited by itself. Before this change it ran in the unit's cgroup and
+  died in both cases.
+- After a SIGKILL to the forwarder, the remaining session's port answered
+  again 0.75 s later. Killed again each time it was back, it came back
+  after 1.0, 1.5 and 2.5 s, with one message.
+- With the forwarder's lock held so that no new one could start, the
+  session reported the failure once, and "port forwarding resumed" once
+  the lock was released.
+- Two sessions starting at once still shared one forwarder.
+- Without `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`, `systemd-run`
+  failed and the forwarder was started directly.
 
 Ports are only added, never removed: a port one session added with `-p`
 stays forwarded until the last session ends. A container on the host's
@@ -551,8 +586,6 @@ be resolved through mDNS or other NSS-only resolvers. `:0`, `unix:0` and
   session of their own (`setsid`, daemons) keep running without them;
   everything else ends with it (see
   [When a session ends](#when-a-session-ends)).
-- A port forwarder started from a systemd unit stops with that unit, even
-  while other sessions on the container still use it.
 - Flow control is a small bounded queue per channel. When one is full,
   reading from the pipe pauses. An X client that stops reading its socket
   can therefore stall the session's other forwards until it reads again or
