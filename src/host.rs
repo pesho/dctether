@@ -137,20 +137,7 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
 
     // `forwardPorts` comes from the configuration on the host; read it while
     // the agent starts.
-    let config = a.forward.then(|| {
-        let dc = dc.clone();
-        let rc_args = crate::forward::read_configuration_args(&a.dc_args);
-        tokio::spawn(async move {
-            Command::new(&dc)
-                .arg("read-configuration")
-                .arg("--include-merged-configuration")
-                .args(&rc_args)
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .await
-        })
-    });
+    let mut config = a.forward.then(|| read_configuration(&dc, &a.dc_args));
 
     // The host's gpg-agent and public keys, also while the agent starts.
     let gpg = a.gpg.then(|| tokio::task::spawn_blocking(host_gpg));
@@ -174,6 +161,12 @@ async fn run(a: ExecArgs) -> Result<i32, String> {
                     Ok(started) => started,
                     Err(_) => {
                         bring_up(&dc, &a.dc_args, a.wayland).await?;
+                        // Read before `up`, it may have failed: up runs
+                        // initializeCommand, which can generate files the
+                        // configuration refers to (a Dockerfile, say).
+                        if let Some(old) = config.replace(read_configuration(&dc, &a.dc_args)) {
+                            old.abort();
+                        }
                         start_agent(&dc, &a.dc_args, &bins).await?
                     }
                 }
@@ -480,44 +473,46 @@ fn wayland_mount() -> Option<String> {
 }
 
 /// What names the container to `devcontainer`, from its arguments: the
-/// workspace folder, the configuration file and the `--id-label`s (in
-/// order). `None` for options not given.
-pub fn container_identity(dc_args: &[String]) -> (Option<String>, Option<String>, Vec<String>) {
-    let (mut workspace, mut config, mut labels) = (None, None, vec![]);
+/// workspace folder (`None` if not given) and the `--id-label`s, in order.
+/// With `--id-label`s, devcontainer finds the container by those labels
+/// instead of by the workspace folder.
+pub fn container_identity(dc_args: &[String]) -> (Option<String>, Vec<String>) {
+    let (mut workspace, mut labels) = (None, vec![]);
     let mut it = dc_args.iter();
     while let Some(a) = it.next() {
         let (name, value) = match a.split_once('=') {
             Some((n, v)) => (n, Some(v.to_string())),
             None => (a.as_str(), None),
         };
-        let slot = match name {
-            "--workspace-folder" => &mut workspace,
-            "--config" => &mut config,
-            "--id-label" => {
-                if let Some(v) = value.or_else(|| it.next().cloned()) {
-                    labels.push(v);
-                }
-                continue;
+        match name {
+            "--workspace-folder" => workspace = value.or_else(|| it.next().cloned()),
+            "--id-label" => labels.extend(value.or_else(|| it.next().cloned())),
+            // Takes a value; skip it so it's never taken for an option.
+            "--config" | "--override-config" if value.is_none() => {
+                it.next();
             }
-            _ => continue,
-        };
-        *slot = value.or_else(|| it.next().cloned());
+            _ => {}
+        }
     }
-    (workspace, config, labels)
+    (workspace, labels)
 }
 
-/// Name of the lock file for bringing up the container with this identity
-/// (paths already absolute).
-pub fn up_lock_name(workspace: &Path, config: Option<&Path>, labels: &[String]) -> String {
+/// Name of the lock file for bringing up the container with this identity:
+/// its `--id-label`s if there are any, else its workspace folder (already
+/// absolute). The configuration file is left out on purpose: the default
+/// one and the same file named with `--config` must share a lock, and two
+/// configurations in one workspace sharing one only means waiting.
+pub fn up_lock_name(workspace: &Path, labels: &[String]) -> String {
     let mut h = Sha256::new();
-    h.update(workspace.as_os_str().as_encoded_bytes());
-    h.update([0]);
-    if let Some(c) = config {
-        h.update(c.as_os_str().as_encoded_bytes());
-    }
-    for l in labels {
-        h.update([0]);
-        h.update(l.as_bytes());
+    if labels.is_empty() {
+        h.update(b"workspace\0");
+        h.update(workspace.as_os_str().as_encoded_bytes());
+    } else {
+        h.update(b"labels");
+        for l in labels {
+            h.update([0]);
+            h.update(l.as_bytes());
+        }
     }
     let digest = h.finalize();
     let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
@@ -529,7 +524,8 @@ pub fn up_lock_name(workspace: &Path, config: Option<&Path>, labels: &[String]) 
 /// `devcontainer up` for it: the CLI doesn't serialize itself, and two at
 /// once create two containers. Paths are made absolute (relative to the
 /// working directory, as devcontainer does) and resolved, so the same
-/// container named differently gets the same lock. Blocks; `None` if
+/// container named differently gets the same lock (see [`up_lock_name`]).
+/// Blocks; `None` if
 /// there's no lock file to use.
 fn acquire_up_lock(dc_args: &[String]) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
@@ -539,10 +535,9 @@ fn acquire_up_lock(dc_args: &[String]) -> Option<std::fs::File> {
         let p = cwd.join(p);
         p.canonicalize().unwrap_or(p)
     };
-    let (workspace, config, labels) = container_identity(dc_args);
+    let (workspace, labels) = container_identity(dc_args);
     let workspace = absolute(workspace.as_deref().unwrap_or("."));
-    let config = config.as_deref().map(absolute);
-    let name = up_lock_name(&workspace, config.as_deref(), &labels);
+    let name = up_lock_name(&workspace, &labels);
     let path = crate::forward::runtime_dir().ok()?.join(name);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -606,6 +601,22 @@ fn is_socket(p: &Path) -> bool {
 }
 
 type ConfigTask = tokio::task::JoinHandle<io::Result<std::process::Output>>;
+
+/// `devcontainer read-configuration`, for `forwardPorts`, in the background.
+fn read_configuration(dc: &str, dc_args: &[String]) -> ConfigTask {
+    let dc = dc.to_string();
+    let rc_args = crate::forward::read_configuration_args(dc_args);
+    tokio::spawn(async move {
+        Command::new(&dc)
+            .arg("read-configuration")
+            .arg("--include-merged-configuration")
+            .args(&rc_args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+    })
+}
 
 /// Make the container's port forwarder forward `forwardPorts` plus `-p`
 /// ports, and report what happened. Problems are reported, not fatal: the
@@ -1706,30 +1717,35 @@ mod tests {
 
     #[test]
     fn finds_what_names_the_container() {
-        assert_eq!(container_identity(&s(&["--log-level", "debug"])), (None, None, vec![]));
+        assert_eq!(container_identity(&s(&["--log-level", "debug"])), (None, vec![]));
         assert_eq!(
             container_identity(&s(&[
                 "--workspace-folder",
                 "/w",
-                "--config=c.json",
+                "--config",
+                "--id-label",
                 "--id-label",
                 "a=1",
                 "--id-label=b=2",
                 "--remote-env",
                 "X=1",
             ])),
-            (Some("/w".into()), Some("c.json".into()), s(&["a=1", "b=2"]))
+            // `--config`'s value is skipped even when it looks like an option.
+            (Some("/w".into()), s(&["a=1", "b=2"]))
         );
     }
 
     #[test]
     fn up_lock_depends_only_on_the_identity() {
-        let a = up_lock_name(Path::new("/w"), None, &[]);
+        let a = up_lock_name(Path::new("/w"), &[]);
         assert!(a.starts_with("up-") && a.ends_with(".lock"));
-        assert_eq!(a, up_lock_name(Path::new("/w"), None, &[]));
-        assert_ne!(a, up_lock_name(Path::new("/v"), None, &[]));
-        assert_ne!(a, up_lock_name(Path::new("/w"), Some(Path::new("/w/c.json")), &[]));
-        assert_ne!(a, up_lock_name(Path::new("/w"), None, &s(&["a=1"])));
+        assert_eq!(a, up_lock_name(Path::new("/w"), &[]));
+        assert_ne!(a, up_lock_name(Path::new("/v"), &[]));
+        // With labels, the workspace doesn't matter.
+        let l = up_lock_name(Path::new("/w"), &s(&["a=1"]));
+        assert_ne!(a, l);
+        assert_eq!(l, up_lock_name(Path::new("/v"), &s(&["a=1"])));
+        assert_ne!(l, up_lock_name(Path::new("/w"), &s(&["a=2"])));
     }
 
     #[test]
