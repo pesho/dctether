@@ -61,7 +61,22 @@ directory, so no options are needed. To pick another container, add
 `--workspace-folder DIR` or `--container-id ID`.
 
 `dctether exec` works with a running container however it was started
-(`devcontainer up`, VS Code, `dctether up`). `dctether up` is
+(`devcontainer up`, VS Code, `dctether up`). With `--up`, it also starts
+the container if it isn't running: when its first `devcontainer exec`
+fails, dctether runs `dctether up` with the same devcontainer options
+(so the Wayland mount is added to a container it creates) and tries
+again. A running container costs nothing extra, and `up`'s lifecycle
+commands (`postStartCommand`, `postAttachCommand`) run only when it
+actually starts or creates the container. `up`'s output goes to stderr.
+`devcontainer up` doesn't serialize itself (two started at once for a
+workspace create two containers), so dctether runs one at a time per
+working directory and set of devcontainer options, and the ones that
+waited try `exec` again first. Tested with Docker 29.10.1 and
+devcontainer CLI 0.91.0: with no container, a stopped one and a running
+one; and three `exec --up` started at once with no container, which
+created one container and ran its lifecycle commands once.
+`--up` can't be combined with `--container-id`, because `up` finds the
+container from the workspace and configuration. `dctether up` is
 `devcontainer up` plus a mount of your Wayland socket. Wayland needs a
 mount made when the container is created, by `dctether up` or by VS Code
 (see [Wayland](#wayland-mounted-at-creation)).
@@ -80,6 +95,8 @@ dctether exec [OPTIONS] [DEVCONTAINER-EXEC-OPTIONS] [-- COMMAND [ARGS...]]
   --x11-relay      always relay X11, even if the host display is reachable directly
   -p PORT          also forward host 127.0.0.1:PORT to the container's PORT
   --no-forward     don't forward any ports
+  --up             if the container isn't running (or doesn't exist), start it
+                   with `dctether up` first
 
 dctether up [--no-wayland] [DEVCONTAINER-UP-OPTIONS]
 

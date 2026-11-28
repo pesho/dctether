@@ -282,7 +282,7 @@ struct Paths {
 
 /// A directory only this user can use: `$XDG_RUNTIME_DIR/dctether`, or
 /// `$TMPDIR/dctether-<uid>` (`/tmp` by default).
-fn runtime_dir() -> io::Result<PathBuf> {
+pub(crate) fn runtime_dir() -> io::Result<PathBuf> {
     let uid = unsafe { libc::getuid() };
     let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| Path::new(d).is_absolute()) {
         Some(d) => Path::new(&d).join("dctether"),
