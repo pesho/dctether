@@ -7,12 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-28
+
 ### Added
 
 - `dctether exec --up` starts the dev container (with `dctether up`,
   Wayland mount included) if it isn't running or doesn't exist yet, then
   runs the command. A running container is used as it is, without
   running `up` and its `postAttachCommand` again.
+
+### Changed
+
+- Background jobs that your command leaves in its session now end with
+  the session, including `nohup` ones. Programs that start a session of
+  their own (`setsid`, self-detaching daemons, a `tmux` server) keep
+  running, as before.
+- SIGTERM or SIGHUP sent to `dctether exec` now first asks the agent to
+  end the command, so it shuts down with its forwards still up and its
+  exit status becomes dctether's. Previously it went to the
+  `devcontainer exec` client, which left the command running. A second
+  signal goes to the client, as before.
+- `DCTETHER_SESSION` is now always set in the command's environment.
 - `dctether up` waits for another `dctether up` or `exec --up` of the same
   container to finish. Two `devcontainer up` at once create two containers
   for one workspace.
@@ -44,19 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A session whose port forwarder goes away (killed, crashed, its
   container agent gone) now asks for its ports again, which starts a new
   forwarder, instead of running on without them.
-
-### Changed
-
-- Background jobs that your command leaves in its session now end with
-  the session, including `nohup` ones. Programs that start a session of
-  their own (`setsid`, self-detaching daemons, a `tmux` server) keep
-  running, as before.
-- SIGTERM or SIGHUP sent to `dctether exec` now first asks the agent to
-  end the command, so it shuts down with its forwards still up and its
-  exit status becomes dctether's. Previously it went to the
-  `devcontainer exec` client, which left the command running. A second
-  signal goes to the client, as before.
-- `DCTETHER_SESSION` is now always set in the command's environment.
 
 ## [0.4.1] - 2026-11-27
 
@@ -165,7 +167,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release builds for Linux and macOS, and a Homebrew tap:
   `brew install pesho/tap/dctether`.
 
-[Unreleased]: https://github.com/pesho/dctether/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/pesho/dctether/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/pesho/dctether/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/pesho/dctether/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/pesho/dctether/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pesho/dctether/compare/v0.2.0...v0.3.0
